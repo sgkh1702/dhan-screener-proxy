@@ -933,6 +933,19 @@ def orb():
         return ok({"error": str(e)}, 500)
 
 
+def _keep_warm():
+    """Ping self every 8 mins to prevent Render free tier spin-down."""
+    import requests as _req
+    time.sleep(60)  # wait for server to start
+    while True:
+        try:
+            port = int(os.environ.get("PORT", 5000))
+            _req.get(f"http://localhost:{port}/nifty", timeout=10)
+            log.info("Keep-warm ping sent")
+        except Exception as e:
+            log.debug(f"Keep-warm ping failed: {e}")
+        time.sleep(480)  # every 8 mins
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"Starting screener proxy v4 on port {port}")
@@ -942,4 +955,7 @@ if __name__ == "__main__":
     t = threading.Thread(target=_bg_loop, daemon=True)
     t.start()
     log.info(f"Background screener started — first run in 10s, then every {BG_INTERVAL}s")
+    # Keep-warm thread (prevents Render free tier spin-down)
+    tw = threading.Thread(target=_keep_warm, daemon=True)
+    tw.start()
     app.run(host="0.0.0.0", port=port, debug=False)
