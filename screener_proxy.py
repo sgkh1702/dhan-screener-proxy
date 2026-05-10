@@ -264,8 +264,8 @@ def quotes():
                 if not day_df.empty and len(day_df) >= 5:
                     avg_vol = int(day_df["Volume"].iloc[:-1].mean())
 
-                # ATR(14) from daily data
-                if not day_df.empty and len(day_df) >= 15:
+                # ATR(14) from daily data — use available data if < 15 days
+                if not day_df.empty and len(day_df) >= 2:
                     hi   = day_df["High"]
                     lo   = day_df["Low"]
                     cl   = day_df["Close"]
@@ -274,8 +274,10 @@ def quotes():
                         hi - lo,
                         (hi - prev).abs(),
                         (lo - prev).abs(),
-                    ], axis=1).max(axis=1)
-                    atr = round(float(tr.rolling(14).mean().iloc[-1]), 2)
+                    ], axis=1).max(axis=1).dropna()
+                    periods = min(14, len(tr))
+                    if periods >= 1:
+                        atr = round(float(tr.tail(periods).mean()), 2)
 
                 pct_change     = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
                 move_from_open = ltp - day_open
@@ -775,15 +777,17 @@ def orb():
                 prev_low  = float(day_df["Low"].iloc[-2])
                 prev_close= float(day_df["Close"].iloc[-2])
 
-                # ── ATR(14) ───────────────────────────────────────────────────
+                # ── ATR(14) — use available data if < 15 days ────────────────
                 atr = None
-                if len(day_df) >= 15:
+                if len(day_df) >= 2:
                     hi   = day_df["High"]
                     lo   = day_df["Low"]
                     cl   = day_df["Close"]
                     prev = cl.shift(1)
-                    tr   = pd.concat([hi-lo, (hi-prev).abs(), (lo-prev).abs()], axis=1).max(axis=1)
-                    atr  = round(float(tr.rolling(14).mean().iloc[-1]), 2)
+                    tr   = pd.concat([hi-lo, (hi-prev).abs(), (lo-prev).abs()], axis=1).max(axis=1).dropna()
+                    periods = min(14, len(tr))
+                    if periods >= 1:
+                        atr = round(float(tr.tail(periods).mean()), 2)
 
                 # ── Candles for target date (today or last trading day) ───────────
                 df15.index = pd.to_datetime(df15.index)
