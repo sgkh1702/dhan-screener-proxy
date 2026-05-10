@@ -1,0 +1,7 @@
+flask
+flask-cors
+yfinance
+pandas
+gspread
+google-auth
+pytz
