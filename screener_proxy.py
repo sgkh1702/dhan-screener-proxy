@@ -41,11 +41,19 @@ _sh = None   # gspread spreadsheet handle
 def connect_sheets():
     global _sh
     try:
-        import gspread
+        import gspread, json, os
         from google.oauth2.service_account import Credentials
         SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
                   "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            creds = Credentials.from_service_account_info(
+                json.loads(creds_json), scopes=SCOPES
+            )
+            log.info("Using GOOGLE_CREDENTIALS_JSON env variable")
+        else:
+            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+            log.info("Using credentials file")
         gc    = gspread.authorize(creds)
         _sh   = gc.open_by_key(SHEET_ID)
         log.info("Google Sheets connected OK")
