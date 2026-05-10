@@ -922,11 +922,12 @@ def orb():
 
 
 if __name__ == "__main__":
-    log.info("Starting screener proxy v4 on http://localhost:5000")
+    port = int(os.environ.get("PORT", 5000))
+    log.info(f"Starting screener proxy v4 on port {port}")
     connect_sheets()
     _preload_cache_from_sheets()   # instant cache restore from Sheets on startup
     # Start background screener thread (runs every 5 min, browser-independent)
     t = threading.Thread(target=_bg_loop, daemon=True)
     t.start()
     log.info(f"Background screener started — first run in 10s, then every {BG_INTERVAL}s")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
