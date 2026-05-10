@@ -518,17 +518,19 @@ def _write_to_sheet(rows, date_str, time_str):
         return
     import gspread
     HEADERS = [
-        "Date","Time","Bias","Symbol","LTP","Chg%",
-        "High","Low","VWAP","Volume","Avg Vol",
-        "Vol Ratio","RS vs Nifty","Mom Score","Rev Score",
+        "Date","Time","Bias","Symbol","LTP","Chg%","Day Open","Prev Close",
+        "High","Low","VWAP","Volume","Avg Vol","Vol Ratio",
+        "RS vs Nifty","Mom Score","Rev Score","ATR","ATR Used%",
     ]
     try:
         try:
             ws = _sh.worksheet("ScreenerData")
         except gspread.WorksheetNotFound:
             ws = _sh.add_worksheet("ScreenerData", rows=10000, cols=len(HEADERS))
+            ws.insert_row(HEADERS, 1)   # write header ONCE on creation
+            log.info("Created ScreenerData tab with headers")
 
-        # New day → clear sheet
+        # New day → clear sheet and rewrite header once
         last_date_file = os.path.join(BASE_DIR, ".screener_last_date")
         try:
             with open(last_date_file) as f:
@@ -537,26 +539,28 @@ def _write_to_sheet(rows, date_str, time_str):
             last_date = ""
         if last_date != date_str:
             ws.clear()
+            ws.insert_row(HEADERS, 1)   # header written ONCE per day
             with open(last_date_file, "w") as f:
                 f.write(date_str)
-            log.info(f"New day {date_str} — ScreenerData cleared")
+            log.info(f"New day {date_str} — ScreenerData cleared, header written")
+        else:
+            # Same day — check header exists, write only if missing
+            try:
+                first_row = ws.row_values(1)
+            except Exception:
+                first_row = []
+            if not first_row or first_row[0] != "Date":
+                ws.insert_row(HEADERS, 1)
+                log.info("Header was missing — written once")
 
-        # Ensure header
-        try:
-            first_row = ws.row_values(1)
-        except Exception:
-            first_row = []
-        if first_row != HEADERS:
-            ws.insert_row(HEADERS, 1)
-
-        # Remove rows for this timestamp (dedup)
+        # Remove rows for this timestamp (dedup — avoid duplicate 5-min slots)
         try:
             existing = ws.get_all_values()
             if len(existing) > 1:
-                keep = [existing[0]]
+                keep = [existing[0]]  # always keep header
                 for row in existing[1:]:
                     if len(row) >= 2 and row[0] == date_str and row[1] == time_str:
-                        pass   # drop old rows for this slot
+                        pass   # drop old rows for this timestamp slot
                     else:
                         keep.append(row)
                 if len(keep) < len(existing):
@@ -565,18 +569,20 @@ def _write_to_sheet(rows, date_str, time_str):
         except Exception as e:
             log.warning(f"Dedup: {e}")
 
-        # Build data rows
+        # Build data rows — now includes Day Open, Prev Close, ATR, ATR Used%
         data = []
         for r in rows:
             data.append([
-                date_str, time_str,
+                date_str,              time_str,
                 r.get("bias",""),      r.get("symbol",""),
                 r.get("ltp",""),       r.get("pct_change",""),
+                r.get("day_open",""),  r.get("prev_close",""),
                 r.get("high",""),      r.get("low",""),
                 r.get("vwap",""),      r.get("volume",""),
                 r.get("avg_volume",""),r.get("vol_ratio",""),
                 r.get("rs",""),        r.get("momentum",""),
-                r.get("reversal",""),
+                r.get("reversal",""),  r.get("atr",""),
+                r.get("atr_consumed",""),
             ])
         ws.append_rows(data, value_input_option="RAW")
         log.info(f"BG sheet: {len(data)} rows written ({date_str} {time_str})")
