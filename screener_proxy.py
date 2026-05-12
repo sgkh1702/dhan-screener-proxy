@@ -457,6 +457,12 @@ TOP_SHEET    = 20    # top 20 bullish + top 20 bearish written to Sheets
 _bg_cache    = {}    # latest scored results (shared with /last_snapshot)
 _bg_lock     = threading.Lock()
 
+# ── ORB two-phase cache ───────────────────────────────────────────────────────
+_orb_shortlist = {}   # built once at 9:30am: sym → {orb_high, orb_low, pdh, pdl, atr}
+_orb_results   = {}   # updated every 5min:   sym → {bull_status, bear_status, ...}
+_orb_date      = ""   # date shortlist was built — reset daily
+_orb_lock      = threading.Lock()
+
 def _fetch_quotes_batch(symbols):
     """yfinance batch fetch for a list of symbols. Returns dict keyed by symbol."""
     if not symbols:
@@ -590,6 +596,220 @@ def _write_to_sheet(rows, date_str, time_str):
         log.error(f"_write_to_sheet: {e}")
 
 
+# ── ORB Phase 1: build shortlist once at/after 9:30am ────────────────────────
+def _build_orb_shortlist(symbols, date_str):
+    import pytz
+    ist   = pytz.timezone("Asia/Kolkata")
+    today = datetime.now(ist).date()
+
+    with _orb_lock:
+        if _orb_date == date_str and _orb_shortlist:
+            return  # already built today
+
+    log.info(f"ORB Phase 1: scanning {len(symbols)} stocks for ORB setups...")
+    t0 = time.time()
+
+    try:
+        tickers = [to_yf(s) for s in symbols]
+        m15   = yf.download(tickers, period="2d",  interval="15m",
+                            group_by="ticker", auto_adjust=True,
+                            progress=False, threads=False)
+        daily = yf.download(tickers, period="30d", interval="1d",
+                            group_by="ticker", auto_adjust=True,
+                            progress=False, threads=False)
+
+        multi    = len(tickers) > 1
+        m15_keys = list(m15.columns.get_level_values(0))   if (multi and not m15.empty)   else []
+        d_keys   = list(daily.columns.get_level_values(0)) if (multi and not daily.empty) else []
+
+        shortlist = {}
+        for sym in symbols:
+            yf_sym = to_yf(sym)
+            try:
+                df15   = m15[yf_sym]   if (multi and yf_sym in m15_keys) else (m15   if not multi else pd.DataFrame())
+                day_df = daily[yf_sym] if (multi and yf_sym in d_keys)   else (daily if not multi else pd.DataFrame())
+
+                if df15.empty or day_df.empty or len(day_df) < 2:
+                    continue
+
+                pdh        = float(day_df["High"].iloc[-2])
+                pdl        = float(day_df["Low"].iloc[-2])
+                prev_close = float(day_df["Close"].iloc[-2])
+
+                # ATR
+                atr = None
+                hi = day_df["High"]; lo = day_df["Low"]; cl = day_df["Close"]
+                tr  = pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1).dropna()
+                if len(tr) >= 1:
+                    atr = round(float(tr.tail(min(14,len(tr))).mean()), 2)
+
+                # Today's first 15min candle
+                df15.index = pd.to_datetime(df15.index)
+                if df15.index.tzinfo is not None:
+                    _dates = [d.astimezone(ist).date() for d in df15.index]
+                else:
+                    _dates = [d.date() for d in df15.index]
+                today_candles = df15[[d == today for d in _dates]]
+                if today_candles.empty:
+                    continue
+
+                orb      = today_candles.iloc[0]
+                orb_high = round(float(orb["High"]), 2)
+                orb_low  = round(float(orb["Low"]),  2)
+                orb_open = round(float(orb["Open"]), 2)
+                gap_pct  = round((orb_open - prev_close) / prev_close * 100, 2) if prev_close else 0
+
+                bull_setup = orb_high > pdh
+                bear_setup = orb_low  < pdl
+                if not bull_setup and not bear_setup:
+                    continue
+
+                shortlist[sym] = {
+                    "orb_high": orb_high, "orb_low": orb_low, "orb_open": orb_open,
+                    "pdh": round(pdh,2),  "pdl": round(pdl,2),
+                    "prev_close": round(prev_close,2),
+                    "atr": atr, "gap_pct": gap_pct,
+                    "bull_setup": bull_setup, "bear_setup": bear_setup,
+                }
+            except Exception as e:
+                log.debug(f"ORB P1 {sym}: {e}")
+
+        with _orb_lock:
+            global _orb_shortlist, _orb_date, _orb_results
+            _orb_shortlist = shortlist
+            _orb_date      = date_str
+            _orb_results   = {}
+
+        bull_n = sum(1 for v in shortlist.values() if v["bull_setup"])
+        bear_n = sum(1 for v in shortlist.values() if v["bear_setup"])
+        log.info(f"ORB Phase 1 done in {round(time.time()-t0)}s — "
+                 f"{len(shortlist)} setups ({bull_n} bull, {bear_n} bear)")
+
+    except Exception as e:
+        log.error(f"_build_orb_shortlist: {e}")
+
+
+# ── ORB Phase 2: update status from already-fetched quotes (fast, no yfinance) 
+def _update_orb_status(all_quotes, date_str, time_str):
+    with _orb_lock:
+        shortlist = dict(_orb_shortlist)
+    if not shortlist:
+        return
+
+    results = {}
+    for sym, orb in shortlist.items():
+        q = all_quotes.get(sym, {})
+        if not q:
+            continue
+
+        ltp       = q.get("ltp",  0) or 0
+        day_high  = q.get("high", 0) or 0   # running candle HIGH
+        day_low   = q.get("low",  0) or 0   # running candle LOW
+        atr       = orb.get("atr") or q.get("atr")
+        atr_consumed = round(abs(ltp - orb["orb_open"]) / atr * 100, 1) if atr else None
+
+        orb_high = orb["orb_high"]
+        orb_low  = orb["orb_low"]
+
+        # Bull: triggered if day HIGH crossed ORB High (not just LTP)
+        bull_status = None
+        if orb["bull_setup"]:
+            if day_high > orb_high:
+                bull_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+            elif day_low < orb_low:
+                bull_status = "Failed"
+            else:
+                bull_status = "Watching"
+
+        # Bear: triggered if day LOW crossed ORB Low
+        bear_status = None
+        if orb["bear_setup"]:
+            if day_low < orb_low:
+                bear_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+            elif day_high > orb_high:
+                bear_status = "Failed"
+            else:
+                bear_status = "Watching"
+
+        orb_range   = orb_high - orb_low
+        bull_target = round(orb_high + (atr or 0), 2) if orb["bull_setup"] else None
+        bear_target = round(orb_low  - (atr or 0), 2) if orb["bear_setup"] else None
+        bull_rr     = round((bull_target - orb_high) / orb_range, 2) if (orb["bull_setup"] and orb_range > 0) else None
+        bear_rr     = round((orb_low - bear_target)  / orb_range, 2) if (orb["bear_setup"] and orb_range > 0) else None
+
+        results[sym] = {
+            "symbol": sym, "ltp": ltp, "day_high": day_high, "day_low": day_low,
+            "orb_high": orb_high, "orb_low": orb_low,
+            "pdh": orb["pdh"], "pdl": orb["pdl"], "prev_close": orb["prev_close"],
+            "gap_pct": orb["gap_pct"], "atr": atr, "atr_consumed": atr_consumed,
+            "bull_setup": orb["bull_setup"], "bear_setup": orb["bear_setup"],
+            "bull_status": bull_status, "bear_status": bear_status,
+            "bull_stop": orb_low,  "bull_target": bull_target, "bull_rr": bull_rr,
+            "bear_stop": orb_high, "bear_target": bear_target, "bear_rr": bear_rr,
+        }
+
+    with _orb_lock:
+        _orb_results.update(results)
+
+    log.info(f"ORB Phase 2: {len(results)} setups updated (instant)")
+    _write_orb_to_sheet(results, date_str, time_str)
+
+
+# ── Write ORB results to GSheet ORBData ──────────────────────────────────────
+def _write_orb_to_sheet(results, date_str, time_str):
+    if _sh is None or not results:
+        return
+    import gspread
+    HEADERS = [
+        "Date","Time","Symbol","Gap%","PDH","PDL",
+        "ORB High","ORB Low","LTP","Day High","Day Low",
+        "Bull Setup","Bull Status","Bull Stop","Bull Target","Bull R:R",
+        "Bear Setup","Bear Status","Bear Stop","Bear Target","Bear R:R",
+        "ATR","ATR Used%",
+    ]
+    try:
+        try:
+            ws = _sh.worksheet("ORBData")
+        except gspread.WorksheetNotFound:
+            ws = _sh.add_worksheet("ORBData", rows=5000, cols=len(HEADERS))
+            ws.insert_row(HEADERS, 1)
+
+        # Clear today's rows and rewrite
+        try:
+            existing = ws.get_all_values()
+            keep = [existing[0]] if existing else [HEADERS]
+            for row in existing[1:]:
+                if row and row[0] == date_str:
+                    continue
+                keep.append(row)
+            ws.clear()
+            ws.update(keep or [HEADERS], "A1")
+        except Exception as e:
+            log.warning(f"ORB sheet dedup: {e}")
+
+        data = []
+        for sym, r in results.items():
+            data.append([
+                date_str, time_str, sym,
+                r.get("gap_pct",""), r.get("pdh",""), r.get("pdl",""),
+                r.get("orb_high",""), r.get("orb_low",""),
+                r.get("ltp",""), r.get("day_high",""), r.get("day_low",""),
+                "Y" if r.get("bull_setup") else "N",
+                r.get("bull_status") or "—",
+                r.get("bull_stop",""), r.get("bull_target",""), r.get("bull_rr",""),
+                "Y" if r.get("bear_setup") else "N",
+                r.get("bear_status") or "—",
+                r.get("bear_stop",""), r.get("bear_target",""), r.get("bear_rr",""),
+                r.get("atr",""), r.get("atr_consumed",""),
+            ])
+        if data:
+            ws.append_rows(data, value_input_option="RAW")
+            log.info(f"ORBData: {len(data)} rows written")
+    except Exception as e:
+        log.error(f"_write_orb_to_sheet: {e}")
+
+
+
 def _bg_run_once():
     """One full screener cycle: fetch all → score → top 20 bull+bear → write Sheets."""
     log.info("BG screener: starting cycle...")
@@ -676,6 +896,23 @@ def _bg_run_once():
 
         # Write to Sheets
         _write_to_sheet(to_write, date_str, time_str)
+
+        # ── ORB Phase 1 (once at 9:30) or Phase 2 (every 5min, instant) ─────
+        try:
+            import pytz as _pytz, datetime as _dt
+            _ist      = _pytz.timezone("Asia/Kolkata")
+            _now_ist  = datetime.now(_ist)
+            _orb_ready = _now_ist.time() >= _dt.time(9, 30)
+            if _orb_ready:
+                with _orb_lock:
+                    _need_p1 = (_orb_date != date_str or not _orb_shortlist)
+                if _need_p1:
+                    _build_orb_shortlist(symbols, date_str)  # slow, once per day
+                else:
+                    _update_orb_status(all_quotes, date_str, time_str)  # fast, every 5min
+        except Exception as _e:
+            log.warning(f"ORB update: {_e}")
+
         log.info(f"BG cycle done in {round(time.time()-t0)}s")
 
     except Exception as e:
@@ -723,245 +960,57 @@ def _preload_cache_from_sheets():
 
 @app.route("/orb")
 def orb():
-    """
-    Opening Range Breakout scanner.
-    Fetches 15min candles for today, computes:
-      - ORB High/Low = first 15min candle H/L
-      - Prev Day High/Low = yesterday's H/L
-      - Bullish setup: ORB High > Prev Day High
-      - Bearish setup: ORB Low  < Prev Day Low
-      - Status: Watching / Triggered / Missed / Failed
-      - Risk, Target, R:R
-    """
+    """Serve ORB results from background cache — instant response."""
     try:
-        sym_param = request.args.get("symbols", "")
-        if sym_param:
-            symbols = [s.strip().upper() for s in sym_param.split(",") if s.strip()]
-        else:
-            symbols = read_fno_csv()
+        with _orb_lock:
+            results   = dict(_orb_results)
+            shortlist = dict(_orb_shortlist)
+            orb_date  = _orb_date
 
-        if not symbols:
-            return ok({"data": {}, "count": 0})
+        if not results and not shortlist:
+            return ok({
+                "data": {}, "count": 0,
+                "message": "ORB scan not yet run — starts after 9:30am IST",
+                "date": orb_date,
+            })
 
-        tickers = [to_yf(s) for s in symbols]
-        log.info(f"ORB: fetching 15min data for {len(tickers)} tickers...")
+        # Merge shortlist info into results for any not-yet-updated stocks
+        merged = {}
+        for sym, orb in shortlist.items():
+            r = results.get(sym, {})
+            merged[sym] = {
+                "symbol":      sym,
+                "ltp":         r.get("ltp", ""),
+                "day_high":    r.get("day_high", ""),
+                "day_low":     r.get("day_low", ""),
+                "orb_high":    orb["orb_high"],
+                "orb_low":     orb["orb_low"],
+                "pdh":         orb["pdh"],
+                "pdl":         orb["pdl"],
+                "prev_close":  orb["prev_close"],
+                "gap_pct":     orb["gap_pct"],
+                "atr":         r.get("atr") or orb.get("atr"),
+                "atr_consumed":r.get("atr_consumed"),
+                "bull_setup":  orb["bull_setup"],
+                "bear_setup":  orb["bear_setup"],
+                "bull_status": r.get("bull_status", "Waiting"),
+                "bear_status": r.get("bear_status", "Waiting"),
+                "bull_stop":   r.get("bull_stop",   orb["orb_low"]),
+                "bull_target": r.get("bull_target"),
+                "bull_rr":     r.get("bull_rr"),
+                "bear_stop":   r.get("bear_stop",   orb["orb_high"]),
+                "bear_target": r.get("bear_target"),
+                "bear_rr":     r.get("bear_rr"),
+                "n_candles":   r.get("n_candles"),
+            }
 
-        # 15min candles for today (last 2 days to get prev day H/L)
-        m15 = yf.download(tickers, period="2d", interval="15m",
-                          group_by="ticker", auto_adjust=True,
-                          progress=False, threads=False)
-        # Daily for prev high/low and ATR
-        daily = yf.download(tickers, period="30d", interval="1d",
-                            group_by="ticker", auto_adjust=True,
-                            progress=False, threads=False)
-
-        multi = len(tickers) > 1
-        m15_cols   = list(m15.columns.get_level_values(0))   if multi and not m15.empty   else []
-        daily_cols = list(daily.columns.get_level_values(0)) if multi and not daily.empty else []
-
-        from datetime import date as dt_date
-        today_date = dt_date.today()
-        results = {}
-
-        for sym in symbols:
-            yf_sym = to_yf(sym)
-            try:
-                if multi:
-                    df15  = m15[yf_sym]   if yf_sym in m15_cols   else pd.DataFrame()
-                    day_df = daily[yf_sym] if yf_sym in daily_cols else pd.DataFrame()
-                else:
-                    df15   = m15
-                    day_df = daily
-
-                if df15.empty or day_df.empty:
-                    continue
-
-                # ── Prev day H/L ─────────────────────────────────────────────
-                if len(day_df) < 2:
-                    continue
-                prev_high = float(day_df["High"].iloc[-2])
-                prev_low  = float(day_df["Low"].iloc[-2])
-                prev_close= float(day_df["Close"].iloc[-2])
-
-                # ── ATR(14) — use available data if < 15 days ────────────────
-                atr = None
-                if len(day_df) >= 2:
-                    hi   = day_df["High"]
-                    lo   = day_df["Low"]
-                    cl   = day_df["Close"]
-                    prev = cl.shift(1)
-                    tr   = pd.concat([hi-lo, (hi-prev).abs(), (lo-prev).abs()], axis=1).max(axis=1).dropna()
-                    periods = min(14, len(tr))
-                    if periods >= 1:
-                        atr = round(float(tr.tail(periods).mean()), 2)
-
-                # ── Candles for target date (today or last trading day) ───────────
-                df15.index = pd.to_datetime(df15.index)
-                if df15.index.tzinfo is not None:
-                    import pytz as _pytz
-                    _ist = _pytz.timezone("Asia/Kolkata")
-                    _dates = [d.astimezone(_ist).date() for d in df15.index]
-                else:
-                    _dates = [d.date() for d in df15.index]
-                today_candles = df15[[d == today_date for d in _dates]]
-
-                if today_candles.empty or len(today_candles) < 1:
-                    continue
-
-                # ── First 15min candle (ORB) ──────────────────────────────────
-                orb_candle = today_candles.iloc[0]
-                orb_high   = round(float(orb_candle["High"]),  2)
-                orb_low    = round(float(orb_candle["Low"]),   2)
-                orb_open   = round(float(orb_candle["Open"]),  2)
-                orb_close  = round(float(orb_candle["Close"]), 2)
-                orb_vol    = int(orb_candle["Volume"])
-
-                # Current price = last candle close
-                ltp        = round(float(today_candles["Close"].iloc[-1]), 2)
-                day_high   = round(float(today_candles["High"].max()), 2)
-                day_low    = round(float(today_candles["Low"].min()),  2)
-                n_candles  = len(today_candles)   # how many 15min candles so far
-
-                gap_pct    = round((orb_open - prev_close) / prev_close * 100, 2) if prev_close else 0
-                atr_consumed = round(abs(ltp - orb_open) / atr * 100, 1) if atr else None
-
-                # ── Avg daily volume (for ORB vol check) ─────────────────────
-                avg_vol = int(day_df["Volume"].iloc[:-1].mean()) if len(day_df) >= 5 else 0
-
-                # ── Bullish setup ─────────────────────────────────────────────
-                bull_setup = orb_high > prev_high   # ORB candle broke prev day high
-
-                # Triggered = any subsequent candle (2,3,4) closed above ORB high
-                # (only candles 2-4, i.e. index 1-3)
-                bull_triggered = False
-                bull_trigger_candle = None
-                if bull_setup and n_candles > 1:
-                    for i in range(1, min(4, n_candles)):
-                        if today_candles["Close"].iloc[i] > orb_high:
-                            bull_triggered      = True
-                            bull_trigger_candle = i + 1   # 1-indexed
-                            break
-
-                # Failed = price broke below ORB low
-                bull_failed = ltp < orb_low and n_candles > 1
-
-                if bull_setup:
-                    if bull_triggered and (atr_consumed is None or atr_consumed <= 80):
-                        bull_status = "Triggered"
-                    elif bull_triggered:
-                        bull_status = "Missed"    # triggered but ATR too consumed
-                    elif bull_failed:
-                        bull_status = "Failed"
-                    else:
-                        bull_status = "Watching"
-                else:
-                    bull_status = None            # no setup
-
-                bull_risk   = round(ltp - orb_low,            2) if bull_setup else None
-                bull_target = round(orb_high + (atr or 0),    2) if bull_setup else None
-                bull_rr     = round((bull_target - orb_high) / (orb_high - orb_low), 2)                               if bull_setup and (orb_high - orb_low) > 0 else None
-
-                # ── Bearish setup ─────────────────────────────────────────────
-                bear_setup = orb_low < prev_low
-
-                bear_triggered = False
-                bear_trigger_candle = None
-                if bear_setup and n_candles > 1:
-                    for i in range(1, min(4, n_candles)):
-                        if today_candles["Close"].iloc[i] < orb_low:
-                            bear_triggered      = True
-                            bear_trigger_candle = i + 1
-                            break
-
-                bear_failed = ltp > orb_high and n_candles > 1
-
-                if bear_setup:
-                    if bear_triggered and (atr_consumed is None or atr_consumed <= 80):
-                        bear_status = "Triggered"
-                    elif bear_triggered:
-                        bear_status = "Missed"
-                    elif bear_failed:
-                        bear_status = "Failed"
-                    else:
-                        bear_status = "Watching"
-                else:
-                    bear_status = None
-
-                bear_risk   = round(orb_high - ltp,           2) if bear_setup else None
-                bear_target = round(orb_low  - (atr or 0),   2) if bear_setup else None
-                bear_rr     = round((orb_low - bear_target) / (orb_high - orb_low), 2)                               if bear_setup and (orb_high - orb_low) > 0 else None
-
-                if not bull_setup and not bear_setup:
-                    continue   # skip — no setup either way
-
-                results[sym] = {
-                    "symbol":       sym,
-                    "ltp":          ltp,
-                    "prev_high":    round(prev_high,  2),
-                    "prev_low":     round(prev_low,   2),
-                    "prev_close":   round(prev_close, 2),
-                    "orb_high":     orb_high,
-                    "orb_low":      orb_low,
-                    "orb_open":     orb_open,
-                    "orb_vol":      orb_vol,
-                    "avg_vol":      avg_vol,
-                    "gap_pct":      gap_pct,
-                    "atr":          atr,
-                    "atr_consumed": atr_consumed,
-                    "n_candles":    n_candles,
-                    "day_high":     day_high,
-                    "day_low":      day_low,
-                    # Bullish
-                    "bull_setup":           bull_setup,
-                    "bull_status":          bull_status,
-                    "bull_trigger_candle":  bull_trigger_candle,
-                    "bull_risk":            bull_risk,
-                    "bull_target":          bull_target,
-                    "bull_rr":              bull_rr,
-                    # Bearish
-                    "bear_setup":           bear_setup,
-                    "bear_status":          bear_status,
-                    "bear_trigger_candle":  bear_trigger_candle,
-                    "bear_risk":            bear_risk,
-                    "bear_target":          bear_target,
-                    "bear_rr":              bear_rr,
-                }
-
-            except Exception as e:
-                log.warning(f"  ORB {sym}: {e}")
-                continue
-
-        log.info(f"ORB: {len(results)} setups found")
-        return ok({"data": results, "count": len(results), "time": datetime.now().isoformat()})
+        return ok({
+            "data":  merged,
+            "count": len(merged),
+            "date":  orb_date,
+            "time":  datetime.now().strftime("%H:%M"),
+        })
 
     except Exception as e:
         log.error(f"/orb: {e}")
         return ok({"error": str(e)}, 500)
-
-
-def _keep_warm():
-    """Ping self every 8 mins to prevent Render free tier spin-down."""
-    import requests as _req
-    time.sleep(60)  # wait for server to start
-    while True:
-        try:
-            port = int(os.environ.get("PORT", 5000))
-            _req.get(f"http://localhost:{port}/nifty", timeout=10)
-            log.info("Keep-warm ping sent")
-        except Exception as e:
-            log.debug(f"Keep-warm ping failed: {e}")
-        time.sleep(480)  # every 8 mins
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    log.info(f"Starting screener proxy v4 on port {port}")
-    connect_sheets()
-    _preload_cache_from_sheets()   # instant cache restore from Sheets on startup
-    # Start background screener thread (runs every 5 min, browser-independent)
-    t = threading.Thread(target=_bg_loop, daemon=True)
-    t.start()
-    log.info(f"Background screener started — first run in 10s, then every {BG_INTERVAL}s")
-    # Keep-warm thread (prevents Render free tier spin-down)
-    tw = threading.Thread(target=_keep_warm, daemon=True)
-    tw.start()
-    app.run(host="0.0.0.0", port=port, debug=False)
