@@ -598,6 +598,7 @@ def _write_to_sheet(rows, date_str, time_str):
 
 # ── ORB Phase 1: build shortlist once at/after 9:30am ────────────────────────
 def _build_orb_shortlist(symbols, date_str):
+    global _orb_shortlist, _orb_date, _orb_results   # declare at top of function
     import pytz
     ist   = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
@@ -675,7 +676,6 @@ def _build_orb_shortlist(symbols, date_str):
                 log.debug(f"ORB P1 {sym}: {e}")
 
         with _orb_lock:
-            global _orb_shortlist, _orb_date, _orb_results
             _orb_shortlist = shortlist
             _orb_date      = date_str
             _orb_results   = {}
