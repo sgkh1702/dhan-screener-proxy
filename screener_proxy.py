@@ -1,19 +1,19 @@
 """
-screener_proxy.py  (v3 - stable)
----------------------------------
-Local Flask server for the Intraday Screener.
+screener_proxy.py  (v4 - fixed startup)
+-----------------------------------------
+Flask proxy server for the Intraday Screener.
 
 Endpoints:
-  GET  /health         -> sanity check
-  GET  /fno            -> reads fno.csv, returns symbol list
-  GET  /nifty          -> Nifty current, prev_close, day_open
-  GET  /quotes         -> batch yfinance quotes for all fno symbols
-  POST /snapshot       -> saves screener rows to Google Sheets (ScreenerData tab)
-
-OI endpoints removed until Dhan scrip master issue is resolved.
+  GET  /health          -> sanity check
+  GET  /fno             -> reads fno.csv, returns symbol list
+  GET  /nifty           -> Nifty current, prev_close, day_open
+  GET  /quotes          -> batch yfinance quotes for all fno symbols
+  POST /snapshot        -> saves screener rows to Google Sheets (ScreenerData tab)
+  GET  /last_snapshot   -> returns latest cached bullish+bearish rows
+  GET  /orb             -> returns ORB setups from background cache (instant)
 
 Run:
-    pip install flask yfinance flask-cors pandas gspread google-auth
+    pip install flask yfinance flask-cors pandas gspread google-auth pytz
     python screener_proxy.py
 """
 
@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
-import json, math, os, time, base64, logging
+import json, math, os, time, logging, threading, urllib.request
 from datetime import datetime
 
 app = Flask(__name__)
@@ -34,14 +34,15 @@ BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
 FNO_CSV          = os.path.join(BASE_DIR, "fno.csv")
 SHEET_ID         = "1R6M0MtF4ImEv4s7_KsLwkFlbd_cea47aAZVt_eZOdIs"
 CREDENTIALS_FILE = os.path.join(BASE_DIR, "optionchain-494805-d75aa6f9c7a0.json")
+RENDER_URL       = "https://dhan-screener-proxy.onrender.com"
 
-# ── Google Sheets (optional — snapshot only) ───────────────────────────────────
+# ── Google Sheets ──────────────────────────────────────────────────────────────
 _sh = None   # gspread spreadsheet handle
 
 def connect_sheets():
     global _sh
     try:
-        import gspread, json, os
+        import gspread
         from google.oauth2.service_account import Credentials
         SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
                   "https://www.googleapis.com/auth/drive"]
@@ -54,8 +55,8 @@ def connect_sheets():
         else:
             creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
             log.info("Using credentials file")
-        gc    = gspread.authorize(creds)
-        _sh   = gc.open_by_key(SHEET_ID)
+        gc  = gspread.authorize(creds)
+        _sh = gc.open_by_key(SHEET_ID)
         log.info("Google Sheets connected OK")
     except Exception as e:
         log.warning(f"Google Sheets not available (snapshots disabled): {e}")
@@ -66,14 +67,13 @@ def read_fno_csv() -> list:
     """
     Reads fno.csv from same folder as this script.
     Handles both:
-      - no header  (plain list): RELIANCE\\nHDFCBANK\\n...
-      - with header: symbol\\nRELIANCE\\n...
+      - no header  (plain list): RELIANCE\nHDFCBANK\n...
+      - with header: symbol\nRELIANCE\n...
     """
     if not os.path.exists(FNO_CSV):
         raise FileNotFoundError(f"fno.csv not found at {FNO_CSV}")
     with open(FNO_CSV) as f:
         first = f.readline().strip()
-    # If first line is not a valid NSE symbol pattern → treat as header
     is_header = not (first.replace("-","").replace("&","").replace("_","").isalnum()
                      and first.isupper() and len(first) < 25)
     df      = pd.read_csv(FNO_CSV, header=0 if is_header else None)
@@ -82,7 +82,7 @@ def read_fno_csv() -> list:
 
 # ── yfinance symbol mapping ────────────────────────────────────────────────────
 YF_MAP = {
-    "M&M":        "M&M.NS",       # yfinance handles & fine internally
+    "M&M":        "M&M.NS",
     "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
     "NAM-INDIA":  "NAM-INDIA.NS",
     "360ONE":     "360ONE.NS",
@@ -106,7 +106,18 @@ def ok(data, status=200):
         status=status,
     )
 
-# ── Signal scoring (used by JSX — replicated here for snapshot labelling) ──────
+# ── Market hours guard ─────────────────────────────────────────────────────────
+def _is_market_hours():
+    """Returns True if current IST time is within Mon-Fri 09:15-15:35."""
+    import pytz, datetime as _dt
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    t = now.time()
+    return _dt.time(9, 15) <= t <= _dt.time(15, 35)
+
+# ── Signal scoring ─────────────────────────────────────────────────────────────
 def score_signal(q, nifty_ret):
     ltp        = q.get("ltp", 0)
     prev_close = q.get("prev_close", ltp)
@@ -129,28 +140,28 @@ def score_signal(q, nifty_ret):
     elif abs(pct) > 1:      mom += 1
     if vol_ratio > 3:       mom += 2
     elif vol_ratio > 2:     mom += 1
-    if pct > 0 and gap_pct > 0.5:   mom += 2
+    if pct > 0 and gap_pct > 0.5:    mom += 2
     elif pct < 0 and gap_pct < -0.5: mom += 2
     elif abs(gap_pct) > 0.2:         mom += 1
-    if pct > 0 and ltp > vwap:  mom += 2
-    elif pct < 0 and ltp < vwap: mom += 2
+    if pct > 0 and ltp > vwap:       mom += 2
+    elif pct < 0 and ltp < vwap:     mom += 2
     elif abs(ltp - vwap) / vwap < 0.002: mom += 1
     if abs(rs) > 1.5:       mom += 2
     elif abs(rs) > 0.5:     mom += 1
 
     rev = 0
-    if abs(pct) > 4:         rev += 2
-    elif abs(pct) > 2.5:     rev += 1
-    if vol_ratio > 4:        rev += 2
-    elif vol_ratio > 2.5:    rev += 1
+    if abs(pct) > 4:          rev += 2
+    elif abs(pct) > 2.5:      rev += 1
+    if vol_ratio > 4:         rev += 2
+    elif vol_ratio > 2.5:     rev += 1
     gap_fade = abs(gap_pct) > 1 and (gap_pct > 0) != (pct - gap_pct > 0)
-    if gap_fade:             rev += 2
-    elif abs(gap_pct) > 0.5: rev += 1
-    if range_pct > 90 and pct > 0:   rev += 2
-    elif range_pct < 10 and pct < 0: rev += 2
+    if gap_fade:              rev += 2
+    elif abs(gap_pct) > 0.5:  rev += 1
+    if range_pct > 90 and pct > 0:    rev += 2
+    elif range_pct < 10 and pct < 0:  rev += 2
     elif range_pct > 80 or range_pct < 20: rev += 1
-    if abs(rs) > 3:          rev += 2
-    elif abs(rs) > 2:        rev += 1
+    if abs(rs) > 3:           rev += 2
+    elif abs(rs) > 2:         rev += 1
 
     bias = "BULL" if pct >= 0 else "BEAR"
     return {
@@ -168,7 +179,8 @@ def score_signal(q, nifty_ret):
 @app.route("/health")
 def health():
     return ok({"status": "ok", "time": datetime.now().isoformat(),
-                "sheets": _sh is not None, "fno_exists": os.path.exists(FNO_CSV)})
+                "sheets": _sh is not None, "fno_exists": os.path.exists(FNO_CSV),
+                "market_hours": _is_market_hours()})
 
 
 @app.route("/fno")
@@ -201,9 +213,6 @@ def nifty():
 @app.route("/quotes")
 def quotes():
     try:
-        # Use request.args to get symbols — but M&M in URL becomes M (& is separator)
-        # We use getlist trick: pass as comma-joined, then re-join all args named 'symbols'
-        # Better: client should encode M%26M; proxy side we also fix M -> M&M
         sym_param = request.args.get("symbols", "")
         if sym_param:
             symbols = [s.strip().upper() for s in sym_param.split(",") if s.strip()]
@@ -216,7 +225,6 @@ def quotes():
         tickers = [to_yf(s) for s in symbols]
         log.info(f"Fetching {len(tickers)} tickers...")
 
-        # threads=False: prevents "dictionary changed size during iteration" in yfinance
         raw   = yf.download(tickers, period="1d",  interval="1m",
                             group_by="ticker", auto_adjust=True,
                             progress=False, threads=False)
@@ -224,9 +232,8 @@ def quotes():
                             group_by="ticker", auto_adjust=True,
                             progress=False, threads=False)
 
-        results = {}
-        multi   = len(tickers) > 1
-        # Snapshot column levels once — avoids mutation during iteration
+        results  = {}
+        multi    = len(tickers) > 1
         raw_cols   = list(raw.columns.get_level_values(0))   if multi and not raw.empty   else []
         daily_cols = list(daily.columns.get_level_values(0)) if multi and not daily.empty else []
 
@@ -264,7 +271,7 @@ def quotes():
                 if not day_df.empty and len(day_df) >= 5:
                     avg_vol = int(day_df["Volume"].iloc[:-1].mean())
 
-                # ATR(14) from daily data — use available data if < 15 days
+                # ATR(14) from daily data — fallback to available days (min 2)
                 if not day_df.empty and len(day_df) >= 2:
                     hi   = day_df["High"]
                     lo   = day_df["Low"]
@@ -333,14 +340,12 @@ def snapshot():
             "Vol Ratio", "RS vs Nifty", "Mom Score", "Rev Score", "Bias",
         ]
 
-        # Get or create ScreenerData sheet
         try:
             ws = _sh.worksheet("ScreenerData")
         except gspread.WorksheetNotFound:
             ws = _sh.add_worksheet("ScreenerData", rows=10000, cols=len(HEADERS))
             log.info("Created ScreenerData tab")
 
-        # Clear on new day
         today = datetime.now().strftime("%Y-%m-%d")
         last_date_file = os.path.join(BASE_DIR, ".screener_last_date")
         try:
@@ -355,7 +360,6 @@ def snapshot():
                 f.write(today)
             log.info(f"New day {today} — ScreenerData cleared")
 
-        # Always ensure header row is correct
         try:
             first_row = ws.row_values(1)
         except Exception:
@@ -364,41 +368,29 @@ def snapshot():
             ws.insert_row(HEADERS, 1)
             log.info("Header row written")
 
-        # Build rows
-        now  = datetime.now()
-        date = now.strftime("%Y-%m-%d")
+        now      = datetime.now()
+        date     = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
         data = []
         for r in rows:
             data.append([
-                date,
-                time_str,
-                r.get("symbol", ""),
-                r.get("ltp", ""),
-                r.get("pct_change", ""),
-                r.get("day_open", ""),
-                r.get("high", ""),
-                r.get("low", ""),
-                r.get("vwap", ""),
-                r.get("volume", ""),
-                r.get("avg_volume", ""),
-                r.get("vol_ratio", ""),
-                r.get("rs", ""),
-                r.get("momentum", ""),
-                r.get("reversal", ""),
-                r.get("bias", ""),
+                date,               time_str,
+                r.get("symbol",""), r.get("ltp",""),
+                r.get("pct_change",""), r.get("day_open",""),
+                r.get("high",""),   r.get("low",""),
+                r.get("vwap",""),   r.get("volume",""),
+                r.get("avg_volume",""), r.get("vol_ratio",""),
+                r.get("rs",""),     r.get("momentum",""),
+                r.get("reversal",""), r.get("bias",""),
             ])
 
-        # Remove existing rows with same date+time to avoid duplicates
-        # Then append fresh data — so each 5-min slot has exactly one row per symbol
         try:
-            existing = ws.get_all_values()  # includes header
+            existing = ws.get_all_values()
             if len(existing) > 1:
-                # Find rows matching today's date and current time slot
-                keep = [existing[0]]  # always keep header
+                keep = [existing[0]]
                 for row in existing[1:]:
                     if len(row) >= 2 and row[0] == date and row[1] == time_str:
-                        pass  # drop this time slot's old rows
+                        pass
                     else:
                         keep.append(row)
                 if len(keep) < len(existing):
@@ -417,8 +409,6 @@ def snapshot():
         return ok({"error": str(e)}, 500)
 
 
-
-
 @app.route("/last_snapshot")
 def last_snapshot():
     """Return most recent top bullish+bearish from in-memory cache (fast) or Sheets fallback."""
@@ -428,7 +418,6 @@ def last_snapshot():
         rows = cached.get("bullish", []) + cached.get("bearish", [])
         return ok({"rows": rows, "date": cached.get("date",""), "time": cached.get("time",""),
                    "count": len(rows), "nifty_ret": cached.get("nifty_ret", 0)})
-    # Fallback: read from Sheets
     if _sh is None:
         return ok({"rows": []})
     try:
@@ -449,27 +438,83 @@ def last_snapshot():
         return ok({"rows": [], "error": str(e)})
 
 
-# ── Background screener thread ─────────────────────────────────────────────────
-import threading
+@app.route("/orb")
+def orb():
+    """Serve ORB results from background cache — instant response."""
+    try:
+        with _orb_lock:
+            results   = dict(_orb_results)
+            shortlist = dict(_orb_shortlist)
+            orb_date  = _orb_date
 
+        if not results and not shortlist:
+            return ok({
+                "data": {}, "count": 0,
+                "message": "ORB scan not yet run — starts after 9:30am IST",
+                "date": orb_date,
+            })
+
+        merged = {}
+        for sym, orb_entry in shortlist.items():
+            r = results.get(sym, {})
+            merged[sym] = {
+                "symbol":      sym,
+                "ltp":         r.get("ltp", ""),
+                "day_high":    r.get("day_high", ""),
+                "day_low":     r.get("day_low", ""),
+                "orb_high":    orb_entry["orb_high"],
+                "orb_low":     orb_entry["orb_low"],
+                "pdh":         orb_entry["pdh"],
+                "pdl":         orb_entry["pdl"],
+                "prev_close":  orb_entry["prev_close"],
+                "gap_pct":     orb_entry["gap_pct"],
+                "atr":         r.get("atr") or orb_entry.get("atr"),
+                "atr_consumed":r.get("atr_consumed"),
+                "bull_setup":  orb_entry["bull_setup"],
+                "bear_setup":  orb_entry["bear_setup"],
+                "bull_status": r.get("bull_status", "Waiting"),
+                "bear_status": r.get("bear_status", "Waiting"),
+                "bull_stop":   r.get("bull_stop",   orb_entry["orb_low"]),
+                "bull_target": r.get("bull_target"),
+                "bull_rr":     r.get("bull_rr"),
+                "bear_stop":   r.get("bear_stop",   orb_entry["orb_high"]),
+                "bear_target": r.get("bear_target"),
+                "bear_rr":     r.get("bear_rr"),
+                "n_candles":   r.get("n_candles"),
+            }
+
+        return ok({
+            "data":  merged,
+            "count": len(merged),
+            "date":  orb_date,
+            "time":  datetime.now().strftime("%H:%M"),
+        })
+
+    except Exception as e:
+        log.error(f"/orb: {e}")
+        return ok({"error": str(e)}, 500)
+
+
+# ── Background screener thread ─────────────────────────────────────────────────
 BG_INTERVAL  = 300   # 5 minutes
 TOP_SHEET    = 20    # top 20 bullish + top 20 bearish written to Sheets
-_bg_cache    = {}    # latest scored results (shared with /last_snapshot)
+_bg_cache    = {}
 _bg_lock     = threading.Lock()
 
-# ── ORB two-phase cache ───────────────────────────────────────────────────────
+# ── ORB two-phase cache ────────────────────────────────────────────────────────
 _orb_shortlist = {}   # built once at 9:30am: sym → {orb_high, orb_low, pdh, pdl, atr}
 _orb_results   = {}   # updated every 5min:   sym → {bull_status, bear_status, ...}
-_orb_date      = ""   # date shortlist was built — reset daily
+_orb_date      = ""
 _orb_lock      = threading.Lock()
+
 
 def _fetch_quotes_batch(symbols):
     """yfinance batch fetch for a list of symbols. Returns dict keyed by symbol."""
     if not symbols:
         return {}
-    tickers  = [to_yf(s) for s in symbols]
-    multi    = len(tickers) > 1
-    results  = {}
+    tickers = [to_yf(s) for s in symbols]
+    multi   = len(tickers) > 1
+    results = {}
     try:
         raw   = yf.download(tickers, period="1d",  interval="1m",
                             group_by="ticker", auto_adjust=True,
@@ -500,16 +545,33 @@ def _fetch_quotes_batch(symbols):
                 vwap     = float((typical * intra["Volume"]).sum() / vol_sum) if vol_sum > 0 else ltp
                 prev_close = ltp
                 avg_vol    = 0
+                atr        = None
                 if not day_df.empty and len(day_df) >= 2:
                     prev_close = float(day_df["Close"].iloc[-2])
                 if not day_df.empty and len(day_df) >= 5:
                     avg_vol = int(day_df["Volume"].iloc[:-1].mean())
-                pct_change = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
+                # ATR — fallback to available days (min 2)
+                if not day_df.empty and len(day_df) >= 2:
+                    hi   = day_df["High"]
+                    lo   = day_df["Low"]
+                    cl   = day_df["Close"]
+                    tr   = pd.concat([
+                        hi - lo,
+                        (hi - cl.shift(1)).abs(),
+                        (lo - cl.shift(1)).abs(),
+                    ], axis=1).max(axis=1).dropna()
+                    periods = min(14, len(tr))
+                    if periods >= 1:
+                        atr = round(float(tr.tail(periods).mean()), 2)
+                pct_change     = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
+                move_from_open = ltp - day_open
+                atr_consumed   = round(abs(move_from_open) / atr * 100, 1) if atr else None
                 results[sym] = {
                     "symbol": sym, "ltp": round(ltp,2), "prev_close": round(prev_close,2),
                     "day_open": round(day_open,2), "high": round(day_high,2),
                     "low": round(day_low,2), "vwap": round(vwap,2),
                     "volume": volume, "avg_volume": avg_vol, "pct_change": round(pct_change,2),
+                    "atr": atr, "atr_consumed": atr_consumed,
                 }
             except Exception as e:
                 log.warning(f"  bg {sym}: {e}")
@@ -533,10 +595,9 @@ def _write_to_sheet(rows, date_str, time_str):
             ws = _sh.worksheet("ScreenerData")
         except gspread.WorksheetNotFound:
             ws = _sh.add_worksheet("ScreenerData", rows=10000, cols=len(HEADERS))
-            ws.insert_row(HEADERS, 1)   # write header ONCE on creation
+            ws.insert_row(HEADERS, 1)
             log.info("Created ScreenerData tab with headers")
 
-        # New day → clear sheet and rewrite header once
         last_date_file = os.path.join(BASE_DIR, ".screener_last_date")
         try:
             with open(last_date_file) as f:
@@ -545,12 +606,11 @@ def _write_to_sheet(rows, date_str, time_str):
             last_date = ""
         if last_date != date_str:
             ws.clear()
-            ws.insert_row(HEADERS, 1)   # header written ONCE per day
+            ws.insert_row(HEADERS, 1)
             with open(last_date_file, "w") as f:
                 f.write(date_str)
             log.info(f"New day {date_str} — ScreenerData cleared, header written")
         else:
-            # Same day — check header exists, write only if missing
             try:
                 first_row = ws.row_values(1)
             except Exception:
@@ -559,14 +619,13 @@ def _write_to_sheet(rows, date_str, time_str):
                 ws.insert_row(HEADERS, 1)
                 log.info("Header was missing — written once")
 
-        # Remove rows for this timestamp (dedup — avoid duplicate 5-min slots)
         try:
             existing = ws.get_all_values()
             if len(existing) > 1:
-                keep = [existing[0]]  # always keep header
+                keep = [existing[0]]
                 for row in existing[1:]:
                     if len(row) >= 2 and row[0] == date_str and row[1] == time_str:
-                        pass   # drop old rows for this timestamp slot
+                        pass
                     else:
                         keep.append(row)
                 if len(keep) < len(existing):
@@ -575,7 +634,6 @@ def _write_to_sheet(rows, date_str, time_str):
         except Exception as e:
             log.warning(f"Dedup: {e}")
 
-        # Build data rows — now includes Day Open, Prev Close, ATR, ATR Used%
         data = []
         for r in rows:
             data.append([
@@ -596,9 +654,9 @@ def _write_to_sheet(rows, date_str, time_str):
         log.error(f"_write_to_sheet: {e}")
 
 
-# ── ORB Phase 1: build shortlist once at/after 9:30am ────────────────────────
+# ── ORB Phase 1: build shortlist once at/after 9:30am ─────────────────────────
 def _build_orb_shortlist(symbols, date_str):
-    global _orb_shortlist, _orb_date, _orb_results   # declare at top of function
+    global _orb_shortlist, _orb_date, _orb_results
     import pytz
     ist   = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
@@ -654,10 +712,10 @@ def _build_orb_shortlist(symbols, date_str):
                 if today_candles.empty:
                     continue
 
-                orb      = today_candles.iloc[0]
-                orb_high = round(float(orb["High"]), 2)
-                orb_low  = round(float(orb["Low"]),  2)
-                orb_open = round(float(orb["Open"]), 2)
+                orb_candle = today_candles.iloc[0]
+                orb_high = round(float(orb_candle["High"]), 2)
+                orb_low  = round(float(orb_candle["Low"]),  2)
+                orb_open = round(float(orb_candle["Open"]), 2)
                 gap_pct  = round((orb_open - prev_close) / prev_close * 100, 2) if prev_close else 0
 
                 bull_setup = orb_high > pdh
@@ -689,7 +747,7 @@ def _build_orb_shortlist(symbols, date_str):
         log.error(f"_build_orb_shortlist: {e}")
 
 
-# ── ORB Phase 2: update status from already-fetched quotes (fast, no yfinance) 
+# ── ORB Phase 2: update status from already-fetched quotes (fast, no yfinance) ─
 def _update_orb_status(all_quotes, date_str, time_str):
     with _orb_lock:
         shortlist = dict(_orb_shortlist)
@@ -702,16 +760,15 @@ def _update_orb_status(all_quotes, date_str, time_str):
         if not q:
             continue
 
-        ltp       = q.get("ltp",  0) or 0
-        day_high  = q.get("high", 0) or 0   # running candle HIGH
-        day_low   = q.get("low",  0) or 0   # running candle LOW
-        atr       = orb.get("atr") or q.get("atr")
+        ltp      = q.get("ltp",  0) or 0
+        day_high = q.get("high", 0) or 0
+        day_low  = q.get("low",  0) or 0
+        atr      = orb.get("atr") or q.get("atr")
         atr_consumed = round(abs(ltp - orb["orb_open"]) / atr * 100, 1) if atr else None
 
         orb_high = orb["orb_high"]
         orb_low  = orb["orb_low"]
 
-        # Bull: triggered if day HIGH crossed ORB High (not just LTP)
         bull_status = None
         if orb["bull_setup"]:
             if day_high > orb_high:
@@ -721,7 +778,6 @@ def _update_orb_status(all_quotes, date_str, time_str):
             else:
                 bull_status = "Watching"
 
-        # Bear: triggered if day LOW crossed ORB Low
         bear_status = None
         if orb["bear_setup"]:
             if day_low < orb_low:
@@ -755,7 +811,7 @@ def _update_orb_status(all_quotes, date_str, time_str):
     _write_orb_to_sheet(results, date_str, time_str)
 
 
-# ── Write ORB results to GSheet ORBData ──────────────────────────────────────
+# ── Write ORB results to GSheet ORBData ───────────────────────────────────────
 def _write_orb_to_sheet(results, date_str, time_str):
     if _sh is None or not results:
         return
@@ -774,7 +830,6 @@ def _write_orb_to_sheet(results, date_str, time_str):
             ws = _sh.add_worksheet("ORBData", rows=5000, cols=len(HEADERS))
             ws.insert_row(HEADERS, 1)
 
-        # Clear today's rows and rewrite
         try:
             existing = ws.get_all_values()
             keep = [existing[0]] if existing else [HEADERS]
@@ -809,9 +864,13 @@ def _write_orb_to_sheet(results, date_str, time_str):
         log.error(f"_write_orb_to_sheet: {e}")
 
 
-
+# ── Main background cycle ──────────────────────────────────────────────────────
 def _bg_run_once():
     """One full screener cycle: fetch all → score → top 20 bull+bear → write Sheets."""
+    if not _is_market_hours():
+        log.info("BG: outside market hours, skipping cycle")
+        return
+
     log.info("BG screener: starting cycle...")
     t0 = time.time()
     try:
@@ -820,7 +879,6 @@ def _bg_run_once():
             log.warning("BG: fno.csv empty, skipping")
             return
 
-        # Nifty return from day open
         nifty_ret = 0
         try:
             nf        = yf.Ticker("^NSEI")
@@ -832,14 +890,12 @@ def _bg_run_once():
         except Exception as e:
             log.warning(f"BG Nifty: {e}")
 
-        # Fetch all in batches of 50
         all_quotes = {}
         for i in range(0, len(symbols), 50):
             batch = symbols[i:i+50]
             all_quotes.update(_fetch_quotes_batch(batch))
         log.info(f"BG: {len(all_quotes)}/{len(symbols)} quotes fetched")
 
-        # Score all stocks
         bullish, bearish = [], []
         for sym, q in all_quotes.items():
             s = score_signal(q, nifty_ret)
@@ -867,49 +923,43 @@ def _bg_run_once():
                 "atr":          q.get("atr"),
                 "atr_consumed": q.get("atr_consumed"),
             }
-            # Strict bull: positive %, above VWAP, positive RS, momentum >= 4
             if pct > 0 and ltp > vwap and rs > 0 and s["momentum"] >= 4:
                 row["bias"] = "BULL"
                 bullish.append(row)
-            # Strict bear: negative %, below VWAP, negative RS, momentum >= 4
             elif pct < 0 and ltp < vwap and rs < 0 and s["momentum"] >= 4:
                 row["bias"] = "BEAR"
                 bearish.append(row)
 
-        # Sort and take top 20 each
         bullish = sorted(bullish, key=lambda x: x["momentum"], reverse=True)[:TOP_SHEET]
         bearish = sorted(bearish, key=lambda x: x["momentum"], reverse=True)[:TOP_SHEET]
         to_write = bullish + bearish
 
         log.info(f"BG scored: {len(bullish)} bullish, {len(bearish)} bearish")
 
-        # Cache for /last_snapshot
         now      = datetime.now()
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
         with _bg_lock:
-            _bg_cache["bullish"]  = bullish
-            _bg_cache["bearish"]  = bearish
-            _bg_cache["date"]     = date_str
-            _bg_cache["time"]     = time_str
-            _bg_cache["nifty_ret"]= round(nifty_ret, 2)
+            _bg_cache["bullish"]   = bullish
+            _bg_cache["bearish"]   = bearish
+            _bg_cache["date"]      = date_str
+            _bg_cache["time"]      = time_str
+            _bg_cache["nifty_ret"] = round(nifty_ret, 2)
 
-        # Write to Sheets
         _write_to_sheet(to_write, date_str, time_str)
 
-        # ── ORB Phase 1 (once at 9:30) or Phase 2 (every 5min, instant) ─────
+        # ORB Phase 1 (once at 9:30) or Phase 2 (every 5min, instant)
         try:
             import pytz as _pytz, datetime as _dt
-            _ist      = _pytz.timezone("Asia/Kolkata")
-            _now_ist  = datetime.now(_ist)
-            _orb_ready = _now_ist.time() >= _dt.time(9, 30)
-            if _orb_ready:
+            _ist     = _pytz.timezone("Asia/Kolkata")
+            _now_ist = datetime.now(_ist)
+            if _now_ist.time() >= _dt.time(9, 30):
                 with _orb_lock:
                     _need_p1 = (_orb_date != date_str or not _orb_shortlist)
                 if _need_p1:
-                    _build_orb_shortlist(symbols, date_str)  # slow, once per day
+                    _build_orb_shortlist(symbols, date_str)
                 else:
-                    _update_orb_status(all_quotes, date_str, time_str)  # fast, every 5min
+                    _update_orb_status(all_quotes, date_str, time_str)
         except Exception as _e:
             log.warning(f"ORB update: {_e}")
 
@@ -921,12 +971,12 @@ def _bg_run_once():
 
 def _bg_loop():
     """Background loop — runs forever, one cycle every BG_INTERVAL seconds."""
-    # Wait 10s after startup before first run (let Flask finish starting)
-    time.sleep(10)
+    time.sleep(10)  # let Flask finish starting
     while True:
         _bg_run_once()
         log.info(f"BG: sleeping {BG_INTERVAL}s until next cycle...")
         time.sleep(BG_INTERVAL)
+
 
 def _preload_cache_from_sheets():
     """On startup, load last snapshot from Sheets into _bg_cache so /last_snapshot is instant."""
@@ -957,60 +1007,27 @@ def _preload_cache_from_sheets():
         log.warning(f"Cache pre-load failed: {e}")
 
 
+# ── Keep-warm ping (prevents Render free tier spin-down) ──────────────────────
+def _keep_warm():
+    """Ping self every 8 min unconditionally — keeps Render alive 24/7."""
+    time.sleep(60)  # wait for Flask to be fully up first
+    while True:
+        try:
+            urllib.request.urlopen(RENDER_URL + "/health", timeout=10)
+            log.info("Keep-warm ping OK")
+        except Exception as e:
+            log.warning(f"Keep-warm ping failed: {e}")
+        time.sleep(480)  # 8 minutes
 
-@app.route("/orb")
-def orb():
-    """Serve ORB results from background cache — instant response."""
-    try:
-        with _orb_lock:
-            results   = dict(_orb_results)
-            shortlist = dict(_orb_shortlist)
-            orb_date  = _orb_date
 
-        if not results and not shortlist:
-            return ok({
-                "data": {}, "count": 0,
-                "message": "ORB scan not yet run — starts after 9:30am IST",
-                "date": orb_date,
-            })
+# ── Entry point ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    connect_sheets()
+    _preload_cache_from_sheets()
 
-        # Merge shortlist info into results for any not-yet-updated stocks
-        merged = {}
-        for sym, orb in shortlist.items():
-            r = results.get(sym, {})
-            merged[sym] = {
-                "symbol":      sym,
-                "ltp":         r.get("ltp", ""),
-                "day_high":    r.get("day_high", ""),
-                "day_low":     r.get("day_low", ""),
-                "orb_high":    orb["orb_high"],
-                "orb_low":     orb["orb_low"],
-                "pdh":         orb["pdh"],
-                "pdl":         orb["pdl"],
-                "prev_close":  orb["prev_close"],
-                "gap_pct":     orb["gap_pct"],
-                "atr":         r.get("atr") or orb.get("atr"),
-                "atr_consumed":r.get("atr_consumed"),
-                "bull_setup":  orb["bull_setup"],
-                "bear_setup":  orb["bear_setup"],
-                "bull_status": r.get("bull_status", "Waiting"),
-                "bear_status": r.get("bear_status", "Waiting"),
-                "bull_stop":   r.get("bull_stop",   orb["orb_low"]),
-                "bull_target": r.get("bull_target"),
-                "bull_rr":     r.get("bull_rr"),
-                "bear_stop":   r.get("bear_stop",   orb["orb_high"]),
-                "bear_target": r.get("bear_target"),
-                "bear_rr":     r.get("bear_rr"),
-                "n_candles":   r.get("n_candles"),
-            }
+    threading.Thread(target=_bg_loop,   daemon=True, name="bg-screener").start()
+    threading.Thread(target=_keep_warm, daemon=True, name="keep-warm").start()
 
-        return ok({
-            "data":  merged,
-            "count": len(merged),
-            "date":  orb_date,
-            "time":  datetime.now().strftime("%H:%M"),
-        })
-
-    except Exception as e:
-        log.error(f"/orb: {e}")
-        return ok({"error": str(e)}, 500)
+    port = int(os.environ.get("PORT", 5000))
+    log.info(f"Starting Flask on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
