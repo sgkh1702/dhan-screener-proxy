@@ -374,7 +374,9 @@ def snapshot():
             ws = _sh.add_worksheet("ScreenerData", rows=10000, cols=len(HEADERS))
             log.info("Created ScreenerData tab")
 
-        now      = datetime.now()
+        import pytz as _pytz_snap
+        _ist_snap = _pytz_snap.timezone("Asia/Kolkata")
+        now      = datetime.now(_ist_snap)
         date     = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
 
@@ -515,19 +517,21 @@ def orb():
                 "bull_stop":            r.get("bull_stop",   orb_entry["orb_low"]),
                 "bull_target":          r.get("bull_target"),
                 "bull_rr":              r.get("bull_rr"),
-                "bull_trigger_candle":  r.get("bull_trigger_candle"),  # int: 2,3,4.. or None
+                "bull_trigger_candle":  r.get("bull_trigger_candle"),  # int: 1,2,3.. or None (C1=9:30)
                 "bear_status":          r.get("bear_status", "Watching"),
                 "bear_stop":            r.get("bear_stop",   orb_entry["orb_high"]),
                 "bear_target":          r.get("bear_target"),
                 "bear_rr":              r.get("bear_rr"),
-                "bear_trigger_candle":  r.get("bear_trigger_candle"),  # int: 2,3,4.. or None
+                "bear_trigger_candle":  r.get("bear_trigger_candle"),  # int: 1,2,3.. or None (C1=9:30)
             }
 
+        import pytz as _pytz_orb
+        _ist_orb = _pytz_orb.timezone("Asia/Kolkata")
         return ok({
             "data":  merged,
             "count": len(merged),
             "date":  orb_date,
-            "time":  datetime.now().strftime("%H:%M"),
+            "time":  datetime.now(_ist_orb).strftime("%H:%M"),
         })
 
     except Exception as e:
@@ -839,14 +843,14 @@ def _update_orb_status(all_quotes, date_str):
     For each stock in _orb_shortlist, fetch 5-min candles for today.
 
     Candle numbering:
-      C1 = 9:15-9:30  15-min (ORB range, already captured in Phase 1)
-      C2 = 9:30-9:35  first 5-min candle after ORB
-      C3 = 9:35-9:40  second 5-min candle
-      C4 = 9:40-9:45  ... and so on
+      ORB range = 9:15-9:30  15-min candle (captured in Phase 1)
+      C1 = 9:30-9:35  first 5-min candle after ORB
+      C2 = 9:35-9:40  second 5-min candle
+      C3 = 9:40-9:45  third 5-min candle ... and so on
 
     Breakout detection:
-      Bull: first 5-min candle (C2+) whose High > ORB High → bull_trigger_candle = N
-      Bear: first 5-min candle (C2+) whose Low  < ORB Low  → bear_trigger_candle = N
+      Bull: first 5-min candle (C1+) whose High > ORB High → bull_trigger_candle = N
+      Bear: first 5-min candle (C1+) whose Low  < ORB Low  → bear_trigger_candle = N
 
     Status:
       Triggered — breakout candle found, ATR consumed <= 80%
@@ -901,7 +905,7 @@ def _update_orb_status(all_quotes, date_str):
         bull_trigger_candle = None
         bear_trigger_candle = None
 
-        # ── Scan 5-min candles from C2 (9:30 IST) onward ─────────────────────
+        # ── Scan 5-min candles from C1 (9:30 IST) onward ─────────────────────
         try:
             df5 = (
                 m5[yf_sym] if (multi and yf_sym in m5_keys)
@@ -919,14 +923,15 @@ def _update_orb_status(all_quotes, date_str):
                     utc     = _pytz.utc
                     idx_ist = [utc.localize(ts).astimezone(ist) for ts in df5.index]
 
-                # Filter: today's candles from 9:30 onward (C2+)
-                c2_start = _dt.time(9, 30)
+                # Filter: today's candles from 9:30 onward (C1+)
+                # C1 = 9:30-9:35, C2 = 9:35-9:40, C3 = 9:40-9:45, ...
+                c1_start = _dt.time(9, 30)
                 candles  = [
-                    (idx + 2, df5.iloc[i])   # candle number: 9:30=C2, 9:35=C3, ...
+                    (idx + 1, df5.iloc[i])   # candle number: 9:30=C1, 9:35=C2, 9:40=C3, ...
                     for i, (ts, idx) in enumerate(
                         zip(idx_ist, range(len(idx_ist)))
                     )
-                    if ts.date() == today and ts.time() >= c2_start
+                    if ts.date() == today and ts.time() >= c1_start
                 ]
 
                 # Bull: first candle whose High exceeds ORB High
@@ -985,12 +990,12 @@ def _update_orb_status(all_quotes, date_str):
             "bull_stop":            orb_low,
             "bull_target":          bull_target,
             "bull_rr":              bull_rr,
-            "bull_trigger_candle":  bull_trigger_candle,   # int: 2,3,4,... or None
+            "bull_trigger_candle":  bull_trigger_candle,   # int: 1,2,3,... or None (C1=9:30, C2=9:35...)
             "bear_status":          bear_status,
             "bear_stop":            orb_high,
             "bear_target":          bear_target,
             "bear_rr":              bear_rr,
-            "bear_trigger_candle":  bear_trigger_candle,   # int: 2,3,4,... or None
+            "bear_trigger_candle":  bear_trigger_candle,   # int: 1,2,3,... or None (C1=9:30, C2=9:35...)
         }
 
     with _orb_lock:
@@ -1084,7 +1089,9 @@ def _bg_run_once():
         log.info(f"BG scored: {len(bullish)} bullish, {len(bearish)} bearish")
 
         # ── Update in-memory screener cache ───────────────────────────────────
-        now      = datetime.now()
+        import pytz as _pytz_bg
+        _ist_bg  = _pytz_bg.timezone("Asia/Kolkata")
+        now      = datetime.now(_ist_bg)
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
         with _bg_lock:
