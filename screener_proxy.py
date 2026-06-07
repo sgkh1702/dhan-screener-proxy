@@ -1,29 +1,22 @@
 """
-screener_proxy.py  (v5 - ORB candle tracking + no ORB GSheet write)
+screener_proxy.py  (v8 - Breeze API, Dhan removed)
 ---------------------------------------------------------------------
-Flask proxy server for the Intraday Screener.
+Flask proxy server for the Options Dashboard.
 
 Endpoints:
   GET  /health          -> sanity check
   GET  /fno             -> reads fno.csv, returns symbol list
   GET  /nifty           -> Nifty current, prev_close, day_open
   GET  /quotes          -> batch yfinance quotes for all fno symbols
-  POST /snapshot        -> saves top screener rows to Google Sheets (ScreenerData tab)
+  POST /snapshot        -> saves top screener rows to Google Sheets
   GET  /last_snapshot   -> returns latest cached bullish+bearish rows
-  GET  /orb             -> returns ORB setups from background cache (instant, memory-only)
-
-ORB design:
-  Phase 1 (once at 9:30am): scans all 209 F&O stocks via 15-min candles
-    -> stocks where 1st candle High > PDH (bull) or 1st candle Low < PDL (bear)
-    -> builds _orb_shortlist in memory
-  Phase 2 (every 5min): fetches 5-min candles for shortlist stocks only (~20-40)
-    -> checks which 5-min candle (C2, C3, C4...) first crossed ORB High/Low
-    -> updates _orb_results in memory
-  No GSheet writes for ORB — everything served from memory via /orb
-
-ScreenerData GSheet:
-  BG thread writes top 20 bull + top 20 bear every 5min (market hours only)
-  /snapshot endpoint writes same schema (called by frontend, also market-hours guarded)
+  GET  /orb             -> ORB setups from background cache
+  GET  /swing           -> multi-timeframe swing screener with divergence
+  GET  /bb_momentum     -> Bollinger Band momentum swing scanner (daily)
+  GET  /gfs             -> Global Filter Screener (monthly RSI + weekly RSI filter, daily RSI output)
+  GET  /expiries        -> upcoming expiry dates (from Token!B14:B20, written by gsheet_bnf.py)
+  GET  /option-chain    -> live option chain via Breeze API
+  GET  /option_ltp      -> CE/PE LTP for specific strikes via Breeze API
 
 Run:
     pip install flask yfinance flask-cors pandas gspread google-auth pytz
@@ -34,8 +27,9 @@ from flask import Flask, request
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
-import json, math, os, time, logging, threading, urllib.request
-from datetime import datetime
+import json, math, os, time, logging, threading, urllib.request, calendar as _calendar
+from datetime import datetime, timedelta
+from breeze_connect import BreezeConnect
 
 app = Flask(__name__)
 CORS(app)
@@ -50,7 +44,7 @@ CREDENTIALS_FILE = os.path.join(BASE_DIR, "optionchain-494805-d75aa6f9c7a0.json"
 RENDER_URL       = "https://dhan-screener-proxy.onrender.com"
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
-_sh = None   # gspread spreadsheet handle
+_sh = None
 
 def connect_sheets():
     global _sh
@@ -63,9 +57,7 @@ def connect_sheets():
         ]
         creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
         if creds_json:
-            creds = Credentials.from_service_account_info(
-                json.loads(creds_json), scopes=SCOPES
-            )
+            creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
             log.info("Using GOOGLE_CREDENTIALS_JSON env variable")
         else:
             creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
@@ -78,27 +70,175 @@ def connect_sheets():
         _sh = None
 
 
+# ── Breeze session ─────────────────────────────────────────────────────────────
+_breeze        = None
+_breeze_ts     = 0
+BREEZE_TTL     = 1800  # re-init session every 30 min
+
+def _init_breeze():
+    """Initialize Breeze session from Token!B10:B12."""
+    global _breeze, _breeze_ts
+    if _sh is None:
+        return None
+    try:
+        ws            = _sh.worksheet("Token")
+        api_key       = (ws.acell("B10").value or "").strip()
+        api_secret    = (ws.acell("B11").value or "").strip()
+        session_token = (ws.acell("B12").value or "").strip()
+        if not all([api_key, api_secret, session_token]):
+            log.warning("Breeze credentials incomplete in Token!B10:B12")
+            return None
+        b = BreezeConnect(api_key=api_key)
+        b.generate_session(api_secret=api_secret, session_token=session_token)
+        _breeze    = b
+        _breeze_ts = time.time()
+        log.info("Breeze session initialized from Token!B10:B12")
+        return b
+    except Exception as e:
+        log.warning(f"Breeze init failed: {e}")
+        return None
+
+def _get_breeze():
+    """Get current Breeze session, re-initializing if stale."""
+    global _breeze, _breeze_ts
+    if _breeze is None or (time.time() - _breeze_ts) > BREEZE_TTL:
+        _init_breeze()
+    return _breeze
+
+# Breeze stock codes for indices
+BREEZE_CODE_MAP = {
+    "BANKNIFTY":  "CNXBAN",
+    "NIFTY":      "NIFTY",
+    "FINNIFTY":   "CNXFIN",
+    "MIDCPNIFTY": "NIFMID",
+    "NIFTYNXT50": "NIFTYNXT50",
+}
+
+BREEZE_STEP_MAP = {
+    "BANKNIFTY":  100,
+    "NIFTY":      50,
+    "FINNIFTY":   50,
+    "MIDCPNIFTY": 25,
+    "NIFTYNXT50": 25,
+}
+
+# Cache for Breeze OC calls: (symbol, expiry) -> {data, ts}
+_breeze_oc_cache     = {}
+_breeze_oc_cache_ttl = 300  # 5 min
+
+def _fetch_breeze_oc(symbol: str, expiry: str):
+    """
+    Fetch full option chain from Breeze (CE + PE).
+    Returns (chain_list, spot) where chain_list is list of dicts.
+    Cached 5 min per (symbol, expiry).
+    """
+    cache_key = (symbol.upper(), expiry)
+    cached    = _breeze_oc_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < _breeze_oc_cache_ttl:
+        log.info(f"Breeze OC cache hit: {symbol} {expiry}")
+        return cached["chain"], cached["spot"]
+
+    breeze = _get_breeze()
+    if not breeze:
+        return [], None
+
+    expiry_iso = f"{expiry}T06:00:00.000Z"
+    oc   = {}
+    spot = 0.0
+
+    for right in ("call", "put"):
+        try:
+            resp    = breeze.get_option_chain_quotes(
+                stock_code=BREEZE_CODE_MAP.get(symbol.upper(), symbol),
+                exchange_code="NFO",
+                product_type="options",
+                expiry_date=expiry_iso,
+                right=right,
+                strike_price=""
+            )
+            records = resp.get("Success") or []
+            if not records:
+                log.warning(f"Breeze OC empty: {symbol} {right} {expiry}")
+                continue
+            for rec in records:
+                strike = str(int(float(rec.get("strike_price", 0))))
+                ltp    = float(rec.get("ltp", 0) or 0)
+                prev   = float(rec.get("previous_close", 0) or 0)
+                oi     = int(float(rec.get("open_interest", 0) or 0))
+                oichg  = int(float(rec.get("chnge_oi", 0) or 0))
+                if spot == 0.0:
+                    sp = rec.get("spot_price", 0)
+                    spot = float(sp) if sp else 0.0
+                if strike not in oc:
+                    oc[strike] = {}
+                side = "ce" if right == "call" else "pe"
+                oc[strike][side] = {
+                    "ltp":        ltp,
+                    "prev_close": prev,
+                    "ltp_chg":    round(ltp - prev, 2),
+                    "oi":         oi,
+                    "oi_chg":     oichg,
+                    "iv":         0,
+                }
+            time.sleep(1)
+        except Exception as e:
+            log.error(f"Breeze OC fetch error ({symbol} {right}): {e}")
+
+    def _signal(oi_chg, ltp_chg):
+        if   oi_chg > 0 and ltp_chg < 0:  return "SB"
+        elif oi_chg > 0 and ltp_chg >= 0: return "LB"
+        elif oi_chg < 0 and ltp_chg >= 0: return "SC"
+        elif oi_chg < 0 and ltp_chg < 0:  return "LU"
+        return ""
+
+    # Build chain list
+    step  = BREEZE_STEP_MAP.get(symbol.upper(), 100)
+    atm   = round(spot / step) * step if spot else 0
+    chain = []
+    for strike_str, sides in sorted(oc.items(), key=lambda x: float(x[0])):
+        strike   = int(float(strike_str))
+        ce       = sides.get("ce", {})
+        pe       = sides.get("pe", {})
+        ce_oi    = ce.get("oi", 0)
+        pe_oi    = pe.get("oi", 0)
+        ce_oichg = ce.get("oi_chg", 0)
+        pe_oichg = pe.get("oi_chg", 0)
+        ce_ltpchg = ce.get("ltp_chg", 0)
+        pe_ltpchg = pe.get("ltp_chg", 0)
+        pcr      = round(pe_oi / ce_oi, 2) if ce_oi else 0
+        chain.append({
+            "strike":     strike,
+            "ce_ltp":     ce.get("ltp", 0),
+            "pe_ltp":     pe.get("ltp", 0),
+            "ce_oi":      ce_oi,
+            "pe_oi":      pe_oi,
+            "ce_oi_chg":  ce_oichg,
+            "pe_oi_chg":  pe_oichg,
+            "ce_iv":      ce.get("iv", 0),
+            "pe_iv":      pe.get("iv", 0),
+            "pcr":        pcr,
+            "signal":     _signal(ce_oichg, ce_ltpchg),
+            "pe_signal":  _signal(pe_oichg, pe_ltpchg),
+        })
+
+    _breeze_oc_cache[cache_key] = {"chain": chain, "spot": spot, "ts": time.time()}
+    log.info(f"Breeze OC fetched: {symbol} {expiry} -> {len(chain)} strikes, spot={spot}")
+    return chain, spot
+
+
 # ── fno.csv reader ─────────────────────────────────────────────────────────────
 def read_fno_csv() -> list:
-    """
-    Reads fno.csv from same folder as this script.
-    Handles both:
-      - no header  (plain list): RELIANCE\nHDFCBANK\n...
-      - with header: symbol\nRELIANCE\n...
-    """
     if not os.path.exists(FNO_CSV):
         raise FileNotFoundError(f"fno.csv not found at {FNO_CSV}")
     with open(FNO_CSV) as f:
         first = f.readline().strip()
     is_header = not (
-        first.replace("-", "").replace("&", "").replace("_", "").isalnum()
-        and first.isupper()
-        and len(first) < 25
+        first.replace("-","").replace("&","").replace("_","").isalnum()
+        and first.isupper() and len(first) < 25
     )
     df      = pd.read_csv(FNO_CSV, header=0 if is_header else None)
-    symbols = [str(s).strip().upper() for s in df.iloc[:, 0].dropna() if str(s).strip()]
+    symbols = [str(s).strip().upper() for s in df.iloc[:,0].dropna() if str(s).strip()]
     return symbols
-
 
 # ── yfinance symbol mapping ────────────────────────────────────────────────────
 YF_MAP = {
@@ -106,18 +246,23 @@ YF_MAP = {
     "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
     "NAM-INDIA":  "NAM-INDIA.NS",
     "360ONE":     "360ONE.NS",
+    # Indices
+    "NIFTY":      "^NSEI",
+    "BANKNIFTY":  "^NSEBANK",
+    "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
+    "MIDCPNIFTY": "^NSEMDCP50",
+    "NIFTYNXT50": "^NSMIDCP",
 }
 
 def to_yf(sym):
     return YF_MAP.get(sym, sym + ".NS")
 
-
 # ── JSON sanitiser ─────────────────────────────────────────────────────────────
 def _clean(obj):
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
-    if isinstance(obj, dict):  return {k: _clean(v) for k, v in obj.items()}
-    if isinstance(obj, list):  return [_clean(v) for v in obj]
+    if isinstance(obj, dict): return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, list): return [_clean(v) for v in obj]
     return obj
 
 def ok(data, status=200):
@@ -127,20 +272,118 @@ def ok(data, status=200):
         status=status,
     )
 
-
 # ── Market hours guard ─────────────────────────────────────────────────────────
 def _is_market_hours():
-    """Returns True if current IST time is within Mon-Fri 09:15-15:35."""
     import pytz, datetime as _dt
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)
-    if now.weekday() >= 5:   # Sat=5, Sun=6
+    if now.weekday() >= 5:
         return False
     t = now.time()
     return _dt.time(9, 15) <= t <= _dt.time(15, 35)
 
+# ── RSI scalar ────────────────────────────────────────────────────────────────
+def _compute_rsi(series, period=14):
+    if series is None or len(series) < period + 1:
+        return None
+    delta = series.diff().dropna()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_l = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs    = avg_g / avg_l.replace(0, float("inf"))
+    rsi   = 100 - (100 / (1 + rs))
+    val   = rsi.iloc[-1]
+    return round(float(val), 2) if not math.isnan(val) else None
 
-# ── Signal scoring ─────────────────────────────────────────────────────────────
+# ── RSI series (for divergence) ───────────────────────────────────────────────
+def _compute_rsi_series(series, period=14):
+    """Returns full RSI series aligned to input index."""
+    if series is None or len(series) < period + 1:
+        return pd.Series(dtype=float)
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_l = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs    = avg_g / avg_l.replace(0, float("inf"))
+    return 100 - (100 / (1 + rs))
+
+# ── EMA scalar ────────────────────────────────────────────────────────────────
+def _compute_ema(series, period=20):
+    if series is None or len(series) < period:
+        return None
+    ema = series.ewm(span=period, adjust=False).mean()
+    val = ema.iloc[-1]
+    return round(float(val), 2) if not math.isnan(val) else None
+
+# ── Divergence detector ───────────────────────────────────────────────────────
+def _compute_divergence(t_df, lookback=12):
+    """
+    Classic RSI divergence — strictly within the last `lookback` candles.
+
+    Uses a warm-up window (RSI period * 3) before the lookback so EWM memory
+    from older bars doesn't bleed into the comparison window. The final
+    comparison only uses the last `lookback` bars.
+
+    Bullish  div: current bar is new N-bar price low  + RSI higher than its N-bar low
+    Bearish  div: current bar is new N-bar price high + RSI lower  than its N-bar high
+
+    Returns: 'bull_div' | 'bear_div' | None
+    """
+    RSI_PERIOD  = 14
+    WARMUP      = RSI_PERIOD * 3          # 42 bars of warm-up before the window
+    needed      = lookback + WARMUP + 1
+
+    try:
+        if t_df is None or len(t_df) < needed:
+            return None
+
+        # Slice: warm-up bars + lookback window (current bar is last)
+        window_df = t_df.iloc[-(needed):]
+
+        low   = window_df["Low"]
+        high  = window_df["High"]
+        rsi_s = _compute_rsi_series(window_df["Close"], RSI_PERIOD)
+
+        if rsi_s.isna().all():
+            return None
+
+        # Now restrict comparison to the strict lookback window only
+        cmp_low  = low.iloc[-lookback:]
+        cmp_high = high.iloc[-lookback:]
+        cmp_rsi  = rsi_s.iloc[-lookback:]
+
+        if cmp_rsi.isna().all() or len(cmp_rsi) < 2:
+            return None
+
+        hist_low  = cmp_low.iloc[:-1]
+        hist_high = cmp_high.iloc[:-1]
+        hist_rsi  = cmp_rsi.iloc[:-1].dropna()
+
+        if hist_rsi.empty:
+            return None
+
+        cur_low  = float(cmp_low.iloc[-1])
+        cur_high = float(cmp_high.iloc[-1])
+        cur_rsi  = float(cmp_rsi.iloc[-1])
+
+        if math.isnan(cur_rsi):
+            return None
+
+        # Bullish: price new N-bar low but RSI NOT at N-bar low
+        if cur_low < float(hist_low.min()) and cur_rsi > float(hist_rsi.min()):
+            return "bull_div"
+
+        # Bearish: price new N-bar high but RSI NOT at N-bar high
+        if cur_high > float(hist_high.max()) and cur_rsi < float(hist_rsi.max()):
+            return "bear_div"
+
+        return None
+    except Exception:
+        return None
+
+# ── Intraday signal scoring ────────────────────────────────────────────────────
 def score_signal(q, nifty_ret):
     ltp        = q.get("ltp", 0)
     prev_close = q.get("prev_close", ltp)
@@ -152,11 +395,11 @@ def score_signal(q, nifty_ret):
     pct        = q.get("pct_change", 0)
     day_open   = q.get("day_open", ltp)
 
-    vol_ratio  = volume / avg_vol if avg_vol > 0 else 0
-    day_range  = high - low
-    range_pct  = ((ltp - low) / day_range * 100) if day_range > 0 else 50
-    rs         = pct - nifty_ret
-    gap_pct    = ((ltp - day_open) / day_open * 100) if day_open > 0 else 0
+    vol_ratio = volume / avg_vol if avg_vol > 0 else 0
+    day_range = high - low
+    range_pct = ((ltp - low) / day_range * 100) if day_range > 0 else 50
+    rs        = pct - nifty_ret
+    gap_pct   = ((ltp - day_open) / day_open * 100) if day_open > 0 else 0
 
     mom = 0
     if abs(pct) > 2:                  mom += 2
@@ -173,18 +416,18 @@ def score_signal(q, nifty_ret):
     elif abs(rs) > 0.5:               mom += 1
 
     rev = 0
-    if abs(pct) > 4:                  rev += 2
-    elif abs(pct) > 2.5:              rev += 1
-    if vol_ratio > 4:                 rev += 2
-    elif vol_ratio > 2.5:             rev += 1
+    if abs(pct) > 4:                   rev += 2
+    elif abs(pct) > 2.5:               rev += 1
+    if vol_ratio > 4:                  rev += 2
+    elif vol_ratio > 2.5:              rev += 1
     gap_fade = abs(gap_pct) > 1 and (gap_pct > 0) != (pct - gap_pct > 0)
-    if gap_fade:                      rev += 2
-    elif abs(gap_pct) > 0.5:          rev += 1
-    if range_pct > 90 and pct > 0:   rev += 2
-    elif range_pct < 10 and pct < 0: rev += 2
+    if gap_fade:                       rev += 2
+    elif abs(gap_pct) > 0.5:           rev += 1
+    if range_pct > 90 and pct > 0:    rev += 2
+    elif range_pct < 10 and pct < 0:  rev += 2
     elif range_pct > 80 or range_pct < 20: rev += 1
-    if abs(rs) > 3:                   rev += 2
-    elif abs(rs) > 2:                 rev += 1
+    if abs(rs) > 3:                    rev += 2
+    elif abs(rs) > 2:                  rev += 1
 
     bias = "BULL" if pct >= 0 else "BEAR"
     return {
@@ -193,6 +436,188 @@ def score_signal(q, nifty_ret):
         "rs":        round(rs, 2),
         "vol_ratio": round(vol_ratio, 2),
         "bias":      bias,
+    }
+
+# ── Universe sets ──────────────────────────────────────────────────────────────
+UNIVERSE_SETS = {
+    "n50": {
+        "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","BAJFINANCE",
+        "SBIN","BHARTIARTL","KOTAKBANK","ITC","LT","HCLTECH","AXISBANK","ASIANPAINT",
+        "MARUTI","SUNPHARMA","TITAN","ULTRACEMCO","WIPRO","ONGC","NESTLEIND","NTPC",
+        "POWERGRID","M&M","ADANIENT","TATAMOTORS","JSWSTEEL","TATASTEEL","ADANIPORTS",
+        "TECHM","INDUSINDBK","HINDALCO","CIPLA","DIVISLAB","BPCL","GRASIM","DRREDDY",
+        "EICHERMOT","COALINDIA","BAJAJFINSV","SBILIFE","BRITANNIA","HEROMOTOCO",
+        "HDFCLIFE","APOLLOHOSP","TATACONSUM","LTIM","UPL","BAJAJ-AUTO",
+    },
+    "nn50": {
+        "ADANIGREEN","ADANITRANS","AMBUJACEM","ACC","ATGL","AUBANK","BANDHANBNK",
+        "BERGEPAINT","BEL","BOSCHLTD","CANBK","CHOLAFIN","COLPAL","CONCOR",
+        "DABUR","DLF","DMART","FEDERALBNK","GAIL","GODREJCP","GODREJPROP",
+        "HAVELLS","ICICIGI","ICICIPRULI","INDUSTOWER","INDIGO","IRCTC","JINDALSTEL",
+        "LICI","LUPIN","MCDOWELL-N","MUTHOOTFIN","NAUKRI","OFSS","PEL","PIDILITIND",
+        "PIIND","PNB","RECLTD","SAIL","SHREECEM","SIEMENS","SRF","TRENT",
+        "TVSMOTOR","UBL","VEDL","VOLTAS","YESBANK","ZOMATO",
+    },
+}
+UNIVERSE_SETS["n200"] = UNIVERSE_SETS["n50"] | UNIVERSE_SETS["nn50"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SWING SCREENER CORE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_swing_fetch(universe_key, tf_key):
+    """
+    Core swing computation. Returns dict ready for JSON serialisation.
+    Includes EMA20, RSI (trade + lower TF), prev high/low, RS rank,
+    and divergence detection.
+    """
+    TF_MAP = {
+        "monthly": ("2y",  "1mo", "1y",  "1wk"),
+        "weekly":  ("1y",  "1wk", "6mo", "1d"),
+        "daily":   ("6mo", "1d",  "60d", "75m"),
+    }
+    DIVERGENCE_LOOKBACK = {
+        "monthly": 12,
+        "weekly":  12,
+        "daily":   12,
+    }
+    if tf_key not in TF_MAP:
+        return {"error": f"Invalid tf '{tf_key}'. Use: monthly, weekly, daily"}
+
+    trade_period, trade_interval, lower_period, lower_interval = TF_MAP[tf_key]
+    div_lookback = DIVERGENCE_LOOKBACK.get(tf_key, 10)
+
+    # ── Universe ──────────────────────────────────────────────────────────────
+    all_fno = read_fno_csv()
+    if universe_key in ("fno", "n500"):
+        symbols = all_fno
+    elif universe_key in UNIVERSE_SETS:
+        symbols = [s for s in all_fno if s in UNIVERSE_SETS[universe_key]]
+    else:
+        return {"error": f"Unknown universe '{universe_key}'"}
+
+    if not symbols:
+        return {"data": [], "count": 0, "tf": tf_key, "universe": universe_key}
+
+    log.info(f"swing fetch: universe={universe_key} ({len(symbols)} stocks) tf={tf_key}")
+    tickers = [to_yf(s) for s in symbols]
+    multi   = len(tickers) > 1
+
+    # ── Nifty return for RS ───────────────────────────────────────────────────
+    nifty_ret = 0
+    try:
+        nf_hist = yf.download(
+            "^NSEI", period=trade_period, interval=trade_interval,
+            auto_adjust=True, progress=False, threads=False
+        )
+        if not nf_hist.empty and len(nf_hist) >= 2:
+            c1 = float(nf_hist["Close"].iloc[-1].iloc[0])
+            c0 = float(nf_hist["Close"].iloc[-2].iloc[0])
+            nifty_ret = (c1 - c0) / c0 * 100
+    except Exception as e:
+        log.warning(f"swing nifty: {e}")
+
+    # ── Trade TF batch fetch ──────────────────────────────────────────────────
+    log.info(f"swing: fetching trade TF ({trade_interval})...")
+    t0 = time.time()
+    try:
+        trade_raw = yf.download(
+            tickers, period=trade_period, interval=trade_interval,
+            group_by="ticker", auto_adjust=True, progress=False, threads=False
+        )
+    except Exception as e:
+        log.error(f"swing trade fetch: {e}")
+        return {"error": str(e)}
+    log.info(f"swing: trade TF done in {round(time.time()-t0)}s")
+
+    # ── Lower TF batch fetch ──────────────────────────────────────────────────
+    log.info(f"swing: fetching lower TF ({lower_interval})...")
+    t0 = time.time()
+    try:
+        lower_raw = yf.download(
+            tickers, period=lower_period, interval=lower_interval,
+            group_by="ticker", auto_adjust=True, progress=False, threads=False
+        )
+    except Exception as e:
+        log.error(f"swing lower fetch: {e}")
+        return {"error": str(e)}
+    log.info(f"swing: lower TF done in {round(time.time()-t0)}s")
+
+    trade_keys = list(trade_raw.columns.get_level_values(0)) if (multi and not trade_raw.empty) else []
+    lower_keys = list(lower_raw.columns.get_level_values(0)) if (multi and not lower_raw.empty) else []
+
+    rs_scores = {}
+    results   = {}
+
+    for sym in symbols:
+        yf_sym = to_yf(sym)
+        try:
+            t_df = (
+                trade_raw[yf_sym] if (multi and yf_sym in trade_keys)
+                else (trade_raw   if not multi else pd.DataFrame())
+            )
+            l_df = (
+                lower_raw[yf_sym] if (multi and yf_sym in lower_keys)
+                else (lower_raw   if not multi else pd.DataFrame())
+            )
+
+            if t_df.empty or len(t_df) < 22:
+                continue
+            t_df = t_df.dropna(subset=["Close"])
+            if len(t_df) < 22:
+                continue
+
+            ltp       = round(float(t_df["Close"].iloc[-1]), 2)
+            prev_high = round(float(t_df["High"].iloc[-2]),  2)
+            prev_low  = round(float(t_df["Low"].iloc[-2]),   2)
+            ema20     = _compute_ema(t_df["Close"], 20)
+            rsi_trade = _compute_rsi(t_df["Close"], 14)
+
+            rsi_lower = None
+            if not l_df.empty and len(l_df) >= 15:
+                l_df      = l_df.dropna(subset=["Close"])
+                rsi_lower = _compute_rsi(l_df["Close"], 14)
+
+            prev_close = round(float(t_df["Close"].iloc[-2]), 2) if len(t_df) >= 2 else ltp
+            rs_pct     = ((ltp - prev_close) / prev_close * 100) - nifty_ret if prev_close else 0
+            rs_scores[sym] = rs_pct
+
+            # ── Divergence ────────────────────────────────────────────────────
+            divergence = _compute_divergence(t_df, lookback=div_lookback)
+
+            results[sym] = {
+                "symbol":     sym,
+                "ltp":        ltp,
+                "ema20":      ema20,
+                "rsi_trade":  rsi_trade,
+                "rsi_lower":  rsi_lower,
+                "prev_high":  prev_high,
+                "prev_low":   prev_low,
+                "rs_pct":     round(rs_pct, 2),
+                "divergence": divergence,
+            }
+
+        except Exception as e:
+            log.debug(f"swing {sym}: {e}")
+            continue
+
+    # ── RS rank 1=strongest ───────────────────────────────────────────────────
+    ranked      = sorted(rs_scores.items(), key=lambda x: x[1], reverse=True)
+    rs_rank_map = {sym: i + 1 for i, (sym, _) in enumerate(ranked)}
+    for sym in results:
+        results[sym]["rs_rank"] = rs_rank_map.get(sym)
+
+    out = list(results.values())
+    bull_div_n = sum(1 for r in out if r.get("divergence") == "bull_div")
+    bear_div_n = sum(1 for r in out if r.get("divergence") == "bear_div")
+    log.info(f"swing done: {len(out)} stocks ({universe_key}/{tf_key}) · div: {bull_div_n}↗ {bear_div_n}↘")
+    return {
+        "data":     out,
+        "count":    len(out),
+        "tf":       tf_key,
+        "universe": universe_key,
+        "time":     datetime.now().isoformat(),
     }
 
 
@@ -297,10 +722,8 @@ def quotes():
                 if not day_df.empty and len(day_df) >= 5:
                     avg_vol = int(day_df["Volume"].iloc[:-1].mean())
                 if not day_df.empty and len(day_df) >= 2:
-                    hi  = day_df["High"]
-                    lo  = day_df["Low"]
-                    cl  = day_df["Close"]
-                    tr  = pd.concat([
+                    hi = day_df["High"]; lo = day_df["Low"]; cl = day_df["Close"]
+                    tr = pd.concat([
                         hi - lo,
                         (hi - cl.shift(1)).abs(),
                         (lo - cl.shift(1)).abs(),
@@ -338,22 +761,32 @@ def quotes():
         return ok({"error": str(e)}, 500)
 
 
+@app.route("/swing")
+def swing():
+    """
+    Multi-timeframe swing screener with divergence detection.
+
+    Query params:
+      universe : fno | n50 | nn50 | n200 | n500   (default: fno)
+      tf       : monthly | weekly | daily           (default: weekly)
+    """
+    try:
+        universe_key = request.args.get("universe", "fno").lower()
+        tf_key       = request.args.get("tf",       "weekly").lower()
+        log.info(f"/swing: live fetch — universe={universe_key} tf={tf_key}")
+        result = _run_swing_fetch(universe_key, tf_key)
+        return ok(result)
+    except Exception as e:
+        log.error(f"/swing: {e}")
+        return ok({"error": str(e)}, 500)
+
+
 @app.route("/snapshot", methods=["POST"])
 def snapshot():
-    """
-    Save screener snapshot rows to Google Sheets ScreenerData tab.
-    Body: { rows: [{bias, symbol, ltp, pct_change, day_open, prev_close,
-                    high, low, vwap, volume, avg_volume, vol_ratio,
-                    rs, momentum, reversal, atr, atr_consumed}] }
-    Column order matches _write_to_sheet exactly (19 cols).
-    Rejects writes outside market hours Mon-Fri 09:15-15:35 IST.
-    """
     if not _is_market_hours():
         return ok({"ok": False, "error": "outside market hours"}, 200)
-
     if _sh is None:
         return ok({"error": "Google Sheets not connected"}, 503)
-
     try:
         import gspread
         body = request.get_json(force=True) or {}
@@ -361,11 +794,10 @@ def snapshot():
         if not rows:
             return ok({"ok": True, "written": 0})
 
-        # Must match _write_to_sheet exactly — same 19-col schema
         HEADERS = [
-            "Date", "Time", "Bias", "Symbol", "LTP", "Chg%", "Day Open", "Prev Close",
-            "High", "Low", "VWAP", "Volume", "Avg Vol", "Vol Ratio",
-            "RS vs Nifty", "Mom Score", "Rev Score", "ATR", "ATR Used%",
+            "Date","Time","Bias","Symbol","LTP","Chg%","Day Open","Prev Close",
+            "High","Low","VWAP","Volume","Avg Vol","Vol Ratio",
+            "RS vs Nifty","Mom Score","Rev Score","ATR","ATR Used%",
         ]
 
         try:
@@ -380,7 +812,6 @@ def snapshot():
         date     = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
 
-        # Shared date file with _write_to_sheet — prevents double-clear race
         last_date_file = os.path.join(BASE_DIR, ".screener_last_date")
         try:
             with open(last_date_file) as f:
@@ -393,7 +824,7 @@ def snapshot():
             ws.insert_row(HEADERS, 1)
             with open(last_date_file, "w") as f:
                 f.write(date)
-            log.info(f"New day {date} — ScreenerData cleared (via /snapshot)")
+            log.info(f"New day {date} — ScreenerData cleared")
         else:
             try:
                 first_row = ws.row_values(1)
@@ -401,42 +832,36 @@ def snapshot():
                 first_row = []
             if not first_row or first_row[0] != "Date":
                 ws.insert_row(HEADERS, 1)
-                log.info("Header was missing — written")
 
-        # Dedup: drop any rows already written for this exact timestamp
         try:
             existing = ws.get_all_values()
             if len(existing) > 1:
                 keep = [existing[0]]
                 for row in existing[1:]:
-                    if len(row) >= 2 and row[0] == date and row[1] == time_str:
-                        pass
-                    else:
+                    if not (len(row) >= 2 and row[0] == date and row[1] == time_str):
                         keep.append(row)
                 if len(keep) < len(existing):
-                    ws.clear()
-                    ws.update(keep, "A1")
-                    log.info(f"Removed {len(existing)-len(keep)} stale rows for {date} {time_str}")
+                    ws.clear(); ws.update(keep, "A1")
         except Exception as e:
-            log.warning(f"Dedup check failed: {e}")
+            log.warning(f"Dedup: {e}")
 
         data = []
         for r in rows:
             data.append([
-                date,                     time_str,
-                r.get("bias", ""),        r.get("symbol", ""),
-                r.get("ltp", ""),         r.get("pct_change", ""),
-                r.get("day_open", ""),    r.get("prev_close", ""),
-                r.get("high", ""),        r.get("low", ""),
-                r.get("vwap", ""),        r.get("volume", ""),
-                r.get("avg_volume", ""),  r.get("vol_ratio", ""),
-                r.get("rs", ""),          r.get("momentum", ""),
-                r.get("reversal", ""),    r.get("atr", ""),
-                r.get("atr_consumed", ""),
+                date,                    time_str,
+                r.get("bias",""),        r.get("symbol",""),
+                r.get("ltp",""),         r.get("pct_change",""),
+                r.get("day_open",""),    r.get("prev_close",""),
+                r.get("high",""),        r.get("low",""),
+                r.get("vwap",""),        r.get("volume",""),
+                r.get("avg_volume",""),  r.get("vol_ratio",""),
+                r.get("rs",""),          r.get("momentum",""),
+                r.get("reversal",""),    r.get("atr",""),
+                r.get("atr_consumed",""),
             ])
 
         ws.append_rows(data, value_input_option="RAW")
-        log.info(f"/snapshot: wrote {len(data)} rows for {date} {time_str}")
+        log.info(f"/snapshot: wrote {len(data)} rows")
         return ok({"ok": True, "written": len(data)})
 
     except Exception as e:
@@ -446,17 +871,16 @@ def snapshot():
 
 @app.route("/last_snapshot")
 def last_snapshot():
-    """Return most recent top bullish+bearish from in-memory cache (fast) or Sheets fallback."""
     with _bg_lock:
         cached = dict(_bg_cache)
     if cached.get("bullish") is not None:
-        rows = cached.get("bullish", []) + cached.get("bearish", [])
+        rows = cached.get("bullish",[]) + cached.get("bearish",[])
         return ok({
             "rows":      rows,
-            "date":      cached.get("date", ""),
-            "time":      cached.get("time", ""),
+            "date":      cached.get("date",""),
+            "time":      cached.get("time",""),
             "count":     len(rows),
-            "nifty_ret": cached.get("nifty_ret", 0),
+            "nifty_ret": cached.get("nifty_ret",0),
         })
     if _sh is None:
         return ok({"rows": []})
@@ -469,9 +893,9 @@ def last_snapshot():
         all_rows  = ws.get_all_records()
         if not all_rows:
             return ok({"rows": []})
-        last_time = all_rows[-1].get("Time", "")
-        last_date = all_rows[-1].get("Date", "")
-        latest    = [r for r in all_rows if r.get("Time") == last_time and r.get("Date") == last_date]
+        last_time = all_rows[-1].get("Time","")
+        last_date = all_rows[-1].get("Date","")
+        latest    = [r for r in all_rows if r.get("Time")==last_time and r.get("Date")==last_date]
         return ok({"rows": latest, "date": last_date, "time": last_time, "count": len(latest)})
     except Exception as e:
         log.error(f"/last_snapshot: {e}")
@@ -480,7 +904,6 @@ def last_snapshot():
 
 @app.route("/orb")
 def orb():
-    """Serve ORB results from background cache — instant, memory-only, no GSheet."""
     try:
         with _orb_lock:
             results   = dict(_orb_results)
@@ -500,9 +923,9 @@ def orb():
             r = results.get(sym, {})
             merged[sym] = {
                 "symbol":               sym,
-                "ltp":                  r.get("ltp", ""),
-                "day_high":             r.get("day_high", ""),
-                "day_low":              r.get("day_low", ""),
+                "ltp":                  r.get("ltp",""),
+                "day_high":             r.get("day_high",""),
+                "day_low":              r.get("day_low",""),
                 "orb_high":             orb_entry["orb_high"],
                 "orb_low":              orb_entry["orb_low"],
                 "pdh":                  orb_entry["pdh"],
@@ -513,16 +936,16 @@ def orb():
                 "atr_consumed":         r.get("atr_consumed"),
                 "bull_setup":           orb_entry["bull_setup"],
                 "bear_setup":           orb_entry["bear_setup"],
-                "bull_status":          r.get("bull_status", "Watching"),
-                "bull_stop":            r.get("bull_stop",   orb_entry["orb_low"]),
+                "bull_status":          r.get("bull_status","Watching"),
+                "bull_stop":            r.get("bull_stop",  orb_entry["orb_low"]),
                 "bull_target":          r.get("bull_target"),
                 "bull_rr":              r.get("bull_rr"),
-                "bull_trigger_candle":  r.get("bull_trigger_candle"),  # int: 1,2,3.. or None (C1=9:30)
-                "bear_status":          r.get("bear_status", "Watching"),
-                "bear_stop":            r.get("bear_stop",   orb_entry["orb_high"]),
+                "bull_trigger_candle":  r.get("bull_trigger_candle"),
+                "bear_status":          r.get("bear_status","Watching"),
+                "bear_stop":            r.get("bear_stop",  orb_entry["orb_high"]),
                 "bear_target":          r.get("bear_target"),
                 "bear_rr":              r.get("bear_rr"),
-                "bear_trigger_candle":  r.get("bear_trigger_candle"),  # int: 1,2,3.. or None (C1=9:30)
+                "bear_trigger_candle":  r.get("bear_trigger_candle"),
             }
 
         import pytz as _pytz_orb
@@ -533,38 +956,26 @@ def orb():
             "date":  orb_date,
             "time":  datetime.now(_ist_orb).strftime("%H:%M"),
         })
-
     except Exception as e:
         log.error(f"/orb: {e}")
         return ok({"error": str(e)}, 500)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# BACKGROUND SCREENER THREAD
+# BACKGROUND THREADS
 # ──────────────────────────────────────────────────────────────────────────────
 BG_INTERVAL = 300   # 5 minutes
-TOP_SHEET   = 20    # top 20 bull + top 20 bear written to ScreenerData
+TOP_SHEET   = 20
 _bg_cache   = {}
 _bg_lock    = threading.Lock()
 
-# ── ORB two-phase cache (memory-only, no GSheet) ──────────────────────────────
-# _orb_shortlist: built once per day at 9:30am via 15-min candles (all 209 stocks)
-#   sym -> {orb_high, orb_low, orb_open, pdh, pdl, prev_close, atr, gap_pct,
-#           bull_setup, bear_setup}
-#
-# _orb_results: updated every 5min via 5-min candles (shortlist stocks only)
-#   sym -> {ltp, day_high, day_low, atr, atr_consumed,
-#           bull_status, bull_stop, bull_target, bull_rr, bull_trigger_candle,
-#           bear_status, bear_stop, bear_target, bear_rr, bear_trigger_candle}
 _orb_shortlist = {}
 _orb_results   = {}
 _orb_date      = ""
 _orb_lock      = threading.Lock()
 
 
-# ── Shared yfinance batch fetch (1-min + 30-day daily) ────────────────────────
 def _fetch_quotes_batch(symbols):
-    """Batch fetch 1-min intraday + 30-day daily for a list of symbols."""
     if not symbols:
         return {}
     tickers = [to_yf(s) for s in symbols]
@@ -585,11 +996,9 @@ def _fetch_quotes_batch(symbols):
             try:
                 intra  = raw[yf_sym]   if (multi and yf_sym in raw_cols)   else (raw   if not multi else pd.DataFrame())
                 day_df = daily[yf_sym] if (multi and yf_sym in daily_cols) else (daily if not multi else pd.DataFrame())
-                if intra.empty:
-                    continue
+                if intra.empty: continue
                 intra = intra.dropna(subset=["Close"])
-                if intra.empty:
-                    continue
+                if intra.empty: continue
 
                 ltp      = float(intra["Close"].iloc[-1])
                 day_open = float(intra["Open"].iloc[0])
@@ -600,22 +1009,14 @@ def _fetch_quotes_batch(symbols):
                 vol_sum  = intra["Volume"].sum()
                 vwap     = float((typical * intra["Volume"]).sum() / vol_sum) if vol_sum > 0 else ltp
 
-                prev_close = ltp
-                avg_vol    = 0
-                atr        = None
+                prev_close = ltp; avg_vol = 0; atr = None
                 if not day_df.empty and len(day_df) >= 2:
                     prev_close = float(day_df["Close"].iloc[-2])
                 if not day_df.empty and len(day_df) >= 5:
                     avg_vol = int(day_df["Volume"].iloc[:-1].mean())
                 if not day_df.empty and len(day_df) >= 2:
-                    hi  = day_df["High"]
-                    lo  = day_df["Low"]
-                    cl  = day_df["Close"]
-                    tr  = pd.concat([
-                        hi - lo,
-                        (hi - cl.shift(1)).abs(),
-                        (lo - cl.shift(1)).abs(),
-                    ], axis=1).max(axis=1).dropna()
+                    hi = day_df["High"]; lo = day_df["Low"]; cl = day_df["Close"]
+                    tr = pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1).dropna()
                     periods = min(14, len(tr))
                     if periods >= 1:
                         atr = round(float(tr.tail(periods).mean()), 2)
@@ -624,18 +1025,10 @@ def _fetch_quotes_batch(symbols):
                 atr_consumed = round(abs(ltp - day_open) / atr * 100, 1) if atr else None
 
                 results[sym] = {
-                    "symbol":       sym,
-                    "ltp":          round(ltp, 2),
-                    "prev_close":   round(prev_close, 2),
-                    "day_open":     round(day_open, 2),
-                    "high":         round(day_high, 2),
-                    "low":          round(day_low, 2),
-                    "vwap":         round(vwap, 2),
-                    "volume":       volume,
-                    "avg_volume":   avg_vol,
-                    "pct_change":   round(pct_change, 2),
-                    "atr":          atr,
-                    "atr_consumed": atr_consumed,
+                    "symbol": sym, "ltp": round(ltp,2), "prev_close": round(prev_close,2),
+                    "day_open": round(day_open,2), "high": round(day_high,2), "low": round(day_low,2),
+                    "vwap": round(vwap,2), "volume": volume, "avg_volume": avg_vol,
+                    "pct_change": round(pct_change,2), "atr": atr, "atr_consumed": atr_consumed,
                 }
             except Exception as e:
                 log.warning(f"  bg {sym}: {e}")
@@ -644,16 +1037,14 @@ def _fetch_quotes_batch(symbols):
     return results
 
 
-# ── ScreenerData GSheet writer ─────────────────────────────────────────────────
 def _write_to_sheet(rows, date_str, time_str):
-    """Write top 20 bull + top 20 bear rows to ScreenerData GSheet tab."""
     if _sh is None or not rows:
         return
     import gspread
     HEADERS = [
-        "Date", "Time", "Bias", "Symbol", "LTP", "Chg%", "Day Open", "Prev Close",
-        "High", "Low", "VWAP", "Volume", "Avg Vol", "Vol Ratio",
-        "RS vs Nifty", "Mom Score", "Rev Score", "ATR", "ATR Used%",
+        "Date","Time","Bias","Symbol","LTP","Chg%","Day Open","Prev Close",
+        "High","Low","VWAP","Volume","Avg Vol","Vol Ratio",
+        "RS vs Nifty","Mom Score","Rev Score","ATR","ATR Used%",
     ]
     try:
         try:
@@ -661,7 +1052,6 @@ def _write_to_sheet(rows, date_str, time_str):
         except gspread.WorksheetNotFound:
             ws = _sh.add_worksheet("ScreenerData", rows=10000, cols=len(HEADERS))
             ws.insert_row(HEADERS, 1)
-            log.info("Created ScreenerData tab with headers")
 
         last_date_file = os.path.join(BASE_DIR, ".screener_last_date")
         try:
@@ -671,11 +1061,9 @@ def _write_to_sheet(rows, date_str, time_str):
             last_date = ""
 
         if last_date != date_str:
-            ws.clear()
-            ws.insert_row(HEADERS, 1)
+            ws.clear(); ws.insert_row(HEADERS, 1)
             with open(last_date_file, "w") as f:
                 f.write(date_str)
-            log.info(f"New day {date_str} — ScreenerData cleared, header written")
         else:
             try:
                 first_row = ws.row_values(1)
@@ -683,37 +1071,28 @@ def _write_to_sheet(rows, date_str, time_str):
                 first_row = []
             if not first_row or first_row[0] != "Date":
                 ws.insert_row(HEADERS, 1)
-                log.info("Header was missing — written")
 
-        # Dedup: remove existing rows for this timestamp before appending
         try:
             existing = ws.get_all_values()
             if len(existing) > 1:
                 keep = [existing[0]]
                 for row in existing[1:]:
-                    if len(row) >= 2 and row[0] == date_str and row[1] == time_str:
-                        pass
-                    else:
+                    if not (len(row) >= 2 and row[0] == date_str and row[1] == time_str):
                         keep.append(row)
                 if len(keep) < len(existing):
-                    ws.clear()
-                    ws.update(keep, "A1")
+                    ws.clear(); ws.update(keep, "A1")
         except Exception as e:
             log.warning(f"Dedup: {e}")
 
         data = []
         for r in rows:
             data.append([
-                date_str,                 time_str,
-                r.get("bias", ""),        r.get("symbol", ""),
-                r.get("ltp", ""),         r.get("pct_change", ""),
-                r.get("day_open", ""),    r.get("prev_close", ""),
-                r.get("high", ""),        r.get("low", ""),
-                r.get("vwap", ""),        r.get("volume", ""),
-                r.get("avg_volume", ""),  r.get("vol_ratio", ""),
-                r.get("rs", ""),          r.get("momentum", ""),
-                r.get("reversal", ""),    r.get("atr", ""),
-                r.get("atr_consumed", ""),
+                date_str, time_str,
+                r.get("bias",""), r.get("symbol",""), r.get("ltp",""), r.get("pct_change",""),
+                r.get("day_open",""), r.get("prev_close",""), r.get("high",""), r.get("low",""),
+                r.get("vwap",""), r.get("volume",""), r.get("avg_volume",""), r.get("vol_ratio",""),
+                r.get("rs",""), r.get("momentum",""), r.get("reversal",""), r.get("atr",""),
+                r.get("atr_consumed",""),
             ])
         ws.append_rows(data, value_input_option="RAW")
         log.info(f"BG sheet: {len(data)} rows written ({date_str} {time_str})")
@@ -721,18 +1100,7 @@ def _write_to_sheet(rows, date_str, time_str):
         log.error(f"_write_to_sheet: {e}")
 
 
-# ── ORB Phase 1: build shortlist once at/after 9:30am ─────────────────────────
 def _build_orb_shortlist(symbols, date_str):
-    """
-    Scan all 209 F&O stocks via 15-min candles.
-
-    Watchlist criteria (1st 15-min candle = C1, 9:15-9:30):
-      bull_setup: C1 High > Prev Day High  →  ORB High becomes the breakout level
-      bear_setup: C1 Low  < Prev Day Low   →  ORB Low  becomes the breakdown level
-
-    ORB range = C1 High / C1 Low (the opening range to watch for breakout).
-    Runs once per day after 9:30am. Result stored in _orb_shortlist (memory).
-    """
     global _orb_shortlist, _orb_date, _orb_results
     import pytz
     ist   = pytz.timezone("Asia/Kolkata")
@@ -740,20 +1108,16 @@ def _build_orb_shortlist(symbols, date_str):
 
     with _orb_lock:
         if _orb_date == date_str and _orb_shortlist:
-            return   # already built today
+            return
 
-    log.info(f"ORB Phase 1: scanning {len(symbols)} stocks for ORB setups...")
+    log.info(f"ORB Phase 1: scanning {len(symbols)} stocks...")
     t0 = time.time()
-
     try:
-        tickers = [to_yf(s) for s in symbols]
-        m15   = yf.download(tickers, period="2d",  interval="15m",
-                            group_by="ticker", auto_adjust=True,
-                            progress=False, threads=False)
-        daily = yf.download(tickers, period="30d", interval="1d",
-                            group_by="ticker", auto_adjust=True,
-                            progress=False, threads=False)
-
+        tickers  = [to_yf(s) for s in symbols]
+        m15      = yf.download(tickers, period="2d",  interval="15m",
+                               group_by="ticker", auto_adjust=True, progress=False, threads=False)
+        daily    = yf.download(tickers, period="30d", interval="1d",
+                               group_by="ticker", auto_adjust=True, progress=False, threads=False)
         multi    = len(tickers) > 1
         m15_keys = list(m15.columns.get_level_values(0))   if (multi and not m15.empty)   else []
         d_keys   = list(daily.columns.get_level_values(0)) if (multi and not daily.empty) else []
@@ -764,28 +1128,18 @@ def _build_orb_shortlist(symbols, date_str):
             try:
                 df15   = m15[yf_sym]   if (multi and yf_sym in m15_keys) else (m15   if not multi else pd.DataFrame())
                 day_df = daily[yf_sym] if (multi and yf_sym in d_keys)   else (daily if not multi else pd.DataFrame())
-
                 if df15.empty or day_df.empty or len(day_df) < 2:
                     continue
 
                 pdh        = float(day_df["High"].iloc[-2])
                 pdl        = float(day_df["Low"].iloc[-2])
                 prev_close = float(day_df["Close"].iloc[-2])
-
-                # ATR(14) from daily, fallback to available days
                 atr = None
-                hi  = day_df["High"]
-                lo  = day_df["Low"]
-                cl  = day_df["Close"]
-                tr  = pd.concat([
-                    hi - lo,
-                    (hi - cl.shift(1)).abs(),
-                    (lo - cl.shift(1)).abs(),
-                ], axis=1).max(axis=1).dropna()
+                hi = day_df["High"]; lo = day_df["Low"]; cl = day_df["Close"]
+                tr = pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1).dropna()
                 if len(tr) >= 1:
-                    atr = round(float(tr.tail(min(14, len(tr))).mean()), 2)
+                    atr = round(float(tr.tail(min(14,len(tr))).mean()), 2)
 
-                # Isolate today's 15-min candles, grab first one (C1 = ORB candle 9:15-9:30)
                 df15.index = pd.to_datetime(df15.index)
                 if df15.index.tzinfo is not None:
                     _dates = [d.astimezone(ist).date() for d in df15.index]
@@ -801,22 +1155,16 @@ def _build_orb_shortlist(symbols, date_str):
                 orb_open = round(float(c1["Open"]),  2)
                 gap_pct  = round((orb_open - prev_close) / prev_close * 100, 2) if prev_close else 0
 
-                bull_setup = orb_high > pdh   # C1 broke above prev day high
-                bear_setup = orb_low  < pdl   # C1 broke below prev day low
+                bull_setup = orb_high > pdh
+                bear_setup = orb_low  < pdl
                 if not bull_setup and not bear_setup:
                     continue
 
                 shortlist[sym] = {
-                    "orb_high":   orb_high,
-                    "orb_low":    orb_low,
-                    "orb_open":   orb_open,
-                    "pdh":        round(pdh, 2),
-                    "pdl":        round(pdl, 2),
-                    "prev_close": round(prev_close, 2),
-                    "atr":        atr,
-                    "gap_pct":    gap_pct,
-                    "bull_setup": bull_setup,
-                    "bear_setup": bear_setup,
+                    "orb_high": orb_high, "orb_low": orb_low, "orb_open": orb_open,
+                    "pdh": round(pdh,2), "pdl": round(pdl,2), "prev_close": round(prev_close,2),
+                    "atr": atr, "gap_pct": gap_pct,
+                    "bull_setup": bull_setup, "bear_setup": bear_setup,
                 }
             except Exception as e:
                 log.debug(f"ORB P1 {sym}: {e}")
@@ -824,44 +1172,16 @@ def _build_orb_shortlist(symbols, date_str):
         with _orb_lock:
             _orb_shortlist = shortlist
             _orb_date      = date_str
-            _orb_results   = {}   # reset Phase 2 results for new day
+            _orb_results   = {}
 
         bull_n = sum(1 for v in shortlist.values() if v["bull_setup"])
         bear_n = sum(1 for v in shortlist.values() if v["bear_setup"])
-        log.info(
-            f"ORB Phase 1 done in {round(time.time()-t0)}s — "
-            f"{len(shortlist)} setups ({bull_n} bull, {bear_n} bear)"
-        )
-
+        log.info(f"ORB Phase 1 done in {round(time.time()-t0)}s — {len(shortlist)} setups ({bull_n} bull, {bear_n} bear)")
     except Exception as e:
         log.error(f"_build_orb_shortlist: {e}")
 
 
-# ── ORB Phase 2: check breakouts via 5-min candles (shortlist stocks only) ────
 def _update_orb_status(all_quotes, date_str):
-    """
-    For each stock in _orb_shortlist, fetch 5-min candles for today.
-
-    Candle numbering:
-      ORB range = 9:15-9:30  15-min candle (captured in Phase 1)
-      C1 = 9:30-9:35  first 5-min candle after ORB
-      C2 = 9:35-9:40  second 5-min candle
-      C3 = 9:40-9:45  third 5-min candle ... and so on
-
-    Breakout detection:
-      Bull: first 5-min candle (C1+) whose High > ORB High → bull_trigger_candle = N
-      Bear: first 5-min candle (C1+) whose Low  < ORB Low  → bear_trigger_candle = N
-
-    Status:
-      Triggered — breakout candle found, ATR consumed <= 80%
-      Missed    — breakout candle found, ATR consumed > 80%
-      Failed    — price crossed the wrong side (stop hit)
-      Watching  — setup valid, no breakout yet
-
-    LTP / day_high / day_low taken from already-fetched all_quotes (1-min based).
-    Only fetches 5-min data for shortlist stocks (~20-40), not all 209.
-    Memory-only — no GSheet write.
-    """
     import pytz, datetime as _dt
     ist   = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
@@ -875,89 +1195,64 @@ def _update_orb_status(all_quotes, date_str):
     tickers = [to_yf(s) for s in syms]
     multi   = len(tickers) > 1
 
-    # Fetch 5-min candles for shortlist stocks only — typically fast (~20-40 stocks)
     try:
         m5 = yf.download(tickers, period="1d", interval="5m",
-                         group_by="ticker", auto_adjust=True,
-                         progress=False, threads=False)
+                         group_by="ticker", auto_adjust=True, progress=False, threads=False)
     except Exception as e:
-        log.error(f"ORB Phase 2 5m fetch failed: {e}")
+        log.error(f"ORB Phase 2 5m fetch: {e}")
         return
 
     m5_keys = list(m5.columns.get_level_values(0)) if (multi and not m5.empty) else []
-
     results = {}
+
     for sym, orb in shortlist.items():
         yf_sym = to_yf(sym)
-
-        # LTP, day range from already-fetched 1-min quotes
         q        = all_quotes.get(sym, {})
         ltp      = q.get("ltp",  0) or 0
         day_high = q.get("high", 0) or 0
         day_low  = q.get("low",  0) or 0
         atr      = orb.get("atr") or q.get("atr")
-        # ATR consumed relative to ORB open (entry reference point)
         atr_consumed = round(abs(ltp - orb["orb_open"]) / atr * 100, 1) if atr else None
-
         orb_high = orb["orb_high"]
         orb_low  = orb["orb_low"]
 
         bull_trigger_candle = None
         bear_trigger_candle = None
 
-        # ── Scan 5-min candles from C1 (9:30 IST) onward ─────────────────────
         try:
-            df5 = (
-                m5[yf_sym] if (multi and yf_sym in m5_keys)
-                else (m5 if not multi else pd.DataFrame())
-            )
+            df5 = (m5[yf_sym] if (multi and yf_sym in m5_keys) else (m5 if not multi else pd.DataFrame()))
             if not df5.empty:
                 df5 = df5.dropna(subset=["Close"])
                 df5.index = pd.to_datetime(df5.index)
-
-                # Normalise index to IST
                 if df5.index.tzinfo is not None:
                     idx_ist = [ts.astimezone(ist) for ts in df5.index]
                 else:
-                    import pytz as _pytz
-                    utc     = _pytz.utc
-                    idx_ist = [utc.localize(ts).astimezone(ist) for ts in df5.index]
+                    import pytz as _pytz2
+                    idx_ist = [_pytz2.utc.localize(ts).astimezone(ist) for ts in df5.index]
 
-                # Filter: today's candles from 9:30 onward (C1+)
-                # C1 = 9:30-9:35, C2 = 9:35-9:40, C3 = 9:40-9:45, ...
                 c1_start = _dt.time(9, 30)
                 candles  = [
-                    (idx + 1, df5.iloc[i])   # candle number: 9:30=C1, 9:35=C2, 9:40=C3, ...
-                    for i, (ts, idx) in enumerate(
-                        zip(idx_ist, range(len(idx_ist)))
-                    )
+                    (idx+1, df5.iloc[i])
+                    for i, (ts, idx) in enumerate(zip(idx_ist, range(len(idx_ist))))
                     if ts.date() == today and ts.time() >= c1_start
                 ]
-
-                # Bull: first candle whose High exceeds ORB High
                 if orb["bull_setup"]:
                     for candle_num, candle in candles:
                         if float(candle["High"]) > orb_high:
-                            bull_trigger_candle = candle_num
-                            break
-
-                # Bear: first candle whose Low breaks below ORB Low
+                            bull_trigger_candle = candle_num; break
                 if orb["bear_setup"]:
                     for candle_num, candle in candles:
                         if float(candle["Low"]) < orb_low:
-                            bear_trigger_candle = candle_num
-                            break
-
+                            bear_trigger_candle = candle_num; break
         except Exception as e:
-            log.debug(f"ORB P2 candle scan {sym}: {e}")
+            log.debug(f"ORB P2 {sym}: {e}")
 
-        # ── Determine status ──────────────────────────────────────────────────
         bull_status = None
         if orb["bull_setup"]:
             if bull_trigger_candle is not None:
                 bull_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
             elif day_low < orb_low:
-                bull_status = "Failed"    # stop breached
+                bull_status = "Failed"
             else:
                 bull_status = "Watching"
 
@@ -966,11 +1261,10 @@ def _update_orb_status(all_quotes, date_str):
             if bear_trigger_candle is not None:
                 bear_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
             elif day_high > orb_high:
-                bear_status = "Failed"    # stop breached
+                bear_status = "Failed"
             else:
                 bear_status = "Watching"
 
-        # ── Targets and R:R ──────────────────────────────────────────────────
         orb_range   = orb_high - orb_low
         bull_target = round(orb_high + (atr or 0), 2) if orb["bull_setup"] else None
         bear_target = round(orb_low  - (atr or 0), 2) if orb["bear_setup"] else None
@@ -978,53 +1272,25 @@ def _update_orb_status(all_quotes, date_str):
         bear_rr     = round((orb_low - bear_target)  / orb_range, 2) if (orb["bear_setup"] and orb_range > 0 and bear_target) else None
 
         results[sym] = {
-            "symbol":               sym,
-            "ltp":                  ltp,
-            "day_high":             day_high,
-            "day_low":              day_low,
-            "atr":                  atr,
-            "atr_consumed":         atr_consumed,
-            "bull_setup":           orb["bull_setup"],
-            "bear_setup":           orb["bear_setup"],
-            "bull_status":          bull_status,
-            "bull_stop":            orb_low,
-            "bull_target":          bull_target,
-            "bull_rr":              bull_rr,
-            "bull_trigger_candle":  bull_trigger_candle,   # int: 1,2,3,... or None (C1=9:30, C2=9:35...)
-            "bear_status":          bear_status,
-            "bear_stop":            orb_high,
-            "bear_target":          bear_target,
-            "bear_rr":              bear_rr,
-            "bear_trigger_candle":  bear_trigger_candle,   # int: 1,2,3,... or None (C1=9:30, C2=9:35...)
+            "symbol": sym, "ltp": ltp, "day_high": day_high, "day_low": day_low,
+            "atr": atr, "atr_consumed": atr_consumed,
+            "bull_setup": orb["bull_setup"], "bear_setup": orb["bear_setup"],
+            "bull_status": bull_status, "bull_stop": orb_low, "bull_target": bull_target,
+            "bull_rr": bull_rr, "bull_trigger_candle": bull_trigger_candle,
+            "bear_status": bear_status, "bear_stop": orb_high, "bear_target": bear_target,
+            "bear_rr": bear_rr, "bear_trigger_candle": bear_trigger_candle,
         }
 
     with _orb_lock:
         _orb_results.update(results)
 
-    triggered_bull = sum(1 for r in results.values() if r.get("bull_status") == "Triggered")
-    triggered_bear = sum(1 for r in results.values() if r.get("bear_status") == "Triggered")
-    log.info(
-        f"ORB Phase 2: {len(results)} setups updated — "
-        f"{triggered_bull} bull triggered, {triggered_bear} bear triggered (memory-only)"
-    )
+    t_bull = sum(1 for r in results.values() if r.get("bull_status") == "Triggered")
+    t_bear = sum(1 for r in results.values() if r.get("bear_status") == "Triggered")
+    log.info(f"ORB Phase 2: {len(results)} updated — {t_bull} bull, {t_bear} bear triggered")
 
 
-# ── Main background cycle ──────────────────────────────────────────────────────
 def _bg_run_once():
-    """
-    One full cycle every 5 min during market hours:
-      1. Fetch all 209 F&O quotes (1-min + daily)
-      2. Score → top 20 bull + top 20 bear → write ScreenerData GSheet
-      3a. ORB Phase 1 (once per day at/after 9:30): build shortlist from 15-min candles
-          then immediately run Phase 2
-      3b. ORB Phase 2 (every 5min): fetch 5-min candles for shortlist only,
-          update status + trigger candle number in memory
-    """
-    if not _is_market_hours():
-        log.info("BG: outside market hours, skipping cycle")
-        return
-
-    log.info("BG screener: starting cycle...")
+    log.info("BG: starting cycle...")
     t0 = time.time()
     try:
         symbols = read_fno_csv()
@@ -1032,7 +1298,11 @@ def _bg_run_once():
             log.warning("BG: fno.csv empty, skipping")
             return
 
-        # ── Nifty return for RS scoring ───────────────────────────────────────
+        if not _is_market_hours():
+            log.info(f"BG: outside market hours — intraday/ORB skipped")
+            return
+
+        # ── Nifty ─────────────────────────────────────────────────────────────
         nifty_ret = 0
         try:
             nf        = yf.Ticker("^NSEI")
@@ -1044,7 +1314,7 @@ def _bg_run_once():
         except Exception as e:
             log.warning(f"BG Nifty: {e}")
 
-        # ── Fetch all 209 quotes in batches of 50 ────────────────────────────
+        # ── Intraday quotes ───────────────────────────────────────────────────
         all_quotes = {}
         for i in range(0, len(symbols), 50):
             all_quotes.update(_fetch_quotes_batch(symbols[i:i+50]))
@@ -1059,41 +1329,28 @@ def _bg_run_once():
             vwap = q.get("vwap", ltp)
             rs   = s["rs"]
             row  = {
-                "symbol":       sym,
-                "ltp":          q.get("ltp"),
-                "pct_change":   q.get("pct_change"),
-                "prev_close":   q.get("prev_close"),
-                "day_open":     q.get("day_open"),
-                "high":         q.get("high"),
-                "low":          q.get("low"),
-                "vwap":         q.get("vwap"),
-                "volume":       q.get("volume"),
-                "avg_volume":   q.get("avg_volume"),
-                "vol_ratio":    s["vol_ratio"],
-                "rs":           rs,
-                "momentum":     s["momentum"],
-                "reversal":     s["reversal"],
-                "atr":          q.get("atr"),
-                "atr_consumed": q.get("atr_consumed"),
+                "symbol": sym, "ltp": q.get("ltp"), "pct_change": q.get("pct_change"),
+                "prev_close": q.get("prev_close"), "day_open": q.get("day_open"),
+                "high": q.get("high"), "low": q.get("low"), "vwap": q.get("vwap"),
+                "volume": q.get("volume"), "avg_volume": q.get("avg_volume"),
+                "vol_ratio": s["vol_ratio"], "rs": rs,
+                "momentum": s["momentum"], "reversal": s["reversal"],
+                "atr": q.get("atr"), "atr_consumed": q.get("atr_consumed"),
             }
             if pct > 0 and ltp > vwap and rs > 0 and s["momentum"] >= 4:
-                row["bias"] = "BULL"
-                bullish.append(row)
+                row["bias"] = "BULL"; bullish.append(row)
             elif pct < 0 and ltp < vwap and rs < 0 and s["momentum"] >= 4:
-                row["bias"] = "BEAR"
-                bearish.append(row)
+                row["bias"] = "BEAR"; bearish.append(row)
 
         bullish  = sorted(bullish, key=lambda x: x["momentum"], reverse=True)[:TOP_SHEET]
         bearish  = sorted(bearish, key=lambda x: x["momentum"], reverse=True)[:TOP_SHEET]
-        to_write = bullish + bearish
-        log.info(f"BG scored: {len(bullish)} bullish, {len(bearish)} bearish")
+        log.info(f"BG scored: {len(bullish)} bull, {len(bearish)} bear")
 
-        # ── Update in-memory screener cache ───────────────────────────────────
         import pytz as _pytz_bg
-        _ist_bg  = _pytz_bg.timezone("Asia/Kolkata")
-        now      = datetime.now(_ist_bg)
+        now      = datetime.now(_pytz_bg.timezone("Asia/Kolkata"))
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M")
+
         with _bg_lock:
             _bg_cache["bullish"]   = bullish
             _bg_cache["bearish"]   = bearish
@@ -1101,48 +1358,35 @@ def _bg_run_once():
             _bg_cache["time"]      = time_str
             _bg_cache["nifty_ret"] = round(nifty_ret, 2)
 
-        # ── Write top 40 to ScreenerData GSheet ──────────────────────────────
-        _write_to_sheet(to_write, date_str, time_str)
+        _write_to_sheet(bullish + bearish, date_str, time_str)
 
-        # ── ORB Phase 1 or Phase 2 ────────────────────────────────────────────
+        # ── ORB ───────────────────────────────────────────────────────────────
         try:
-            import pytz as _pytz, datetime as _dt
-            _ist     = _pytz.timezone("Asia/Kolkata")
-            _now_ist = datetime.now(_ist)
-
-            if _now_ist.time() >= _dt.time(9, 30):
+            import pytz as _pytz2, datetime as _dt2
+            _now_ist = datetime.now(_pytz2.timezone("Asia/Kolkata"))
+            if _now_ist.time() >= _dt2.time(9, 30):
                 with _orb_lock:
                     _need_p1 = (_orb_date != date_str or not _orb_shortlist)
-
                 if _need_p1:
-                    # Phase 1: build shortlist (runs once per day after 9:30am)
                     _build_orb_shortlist(symbols, date_str)
-                    # Immediately run Phase 2 so status is populated right away
-                    _update_orb_status(all_quotes, date_str)
-                else:
-                    # Phase 2: update status + trigger candle from 5-min data
-                    _update_orb_status(all_quotes, date_str)
-
-        except Exception as _e:
-            log.warning(f"ORB update: {_e}")
+                _update_orb_status(all_quotes, date_str)
+        except Exception as e:
+            log.warning(f"ORB update: {e}")
 
         log.info(f"BG cycle done in {round(time.time()-t0)}s")
-
     except Exception as e:
         log.error(f"BG cycle error: {e}")
 
 
 def _bg_loop():
-    """Background loop — one cycle every BG_INTERVAL seconds, forever."""
-    time.sleep(10)   # let Flask finish starting up
+    time.sleep(10)
     while True:
         _bg_run_once()
-        log.info(f"BG: sleeping {BG_INTERVAL}s until next cycle...")
+        log.info(f"BG: sleeping {BG_INTERVAL}s...")
         time.sleep(BG_INTERVAL)
 
 
 def _preload_cache_from_sheets():
-    """On startup, load last ScreenerData snapshot into memory so /last_snapshot is instant."""
     if _sh is None:
         return
     try:
@@ -1154,41 +1398,332 @@ def _preload_cache_from_sheets():
         all_rows  = ws.get_all_records()
         if not all_rows:
             return
-        last_time = all_rows[-1].get("Time", "")
-        last_date = all_rows[-1].get("Date", "")
-        latest    = [r for r in all_rows if r.get("Time") == last_time and r.get("Date") == last_date]
-        bullish   = [r for r in latest if str(r.get("Bias", "")).upper() == "BULL"]
-        bearish   = [r for r in latest if str(r.get("Bias", "")).upper() == "BEAR"]
+        last_time = all_rows[-1].get("Time","")
+        last_date = all_rows[-1].get("Date","")
+        latest    = [r for r in all_rows if r.get("Time")==last_time and r.get("Date")==last_date]
+        bullish   = [r for r in latest if str(r.get("Bias","")).upper()=="BULL"]
+        bearish   = [r for r in latest if str(r.get("Bias","")).upper()=="BEAR"]
         with _bg_lock:
             _bg_cache["bullish"]   = bullish
             _bg_cache["bearish"]   = bearish
             _bg_cache["date"]      = last_date
             _bg_cache["time"]      = last_time
             _bg_cache["nifty_ret"] = 0
-        log.info(
-            f"Cache pre-loaded: {len(bullish)} bull + {len(bearish)} bear "
-            f"({last_date} {last_time})"
-        )
+        log.info(f"Cache pre-loaded: {len(bullish)} bull + {len(bearish)} bear ({last_date} {last_time})")
     except Exception as e:
-        log.warning(f"Cache pre-load failed: {e}")
+        log.warning(f"Cache pre-load: {e}")
 
 
-# ── Keep-warm ping (prevents Render free tier spin-down) ──────────────────────
 def _keep_warm():
-    """Ping self every 8 min — keeps Render free tier from spinning down."""
-    time.sleep(60)   # wait for Flask to be fully up
+    time.sleep(60)
     while True:
         try:
             urllib.request.urlopen(RENDER_URL + "/health", timeout=10)
             log.info("Keep-warm ping OK")
         except Exception as e:
-            log.warning(f"Keep-warm ping failed: {e}")
-        time.sleep(480)   # 8 minutes
+            log.warning(f"Keep-warm ping: {e}")
+        time.sleep(480)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# GFS SCREENER  (Global Filter Screener)
+# Monthly RSI > threshold  AND  Weekly RSI > threshold
+# Daily RSI shown as-is for user decision
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _run_gfs(universe_key, monthly_rsi_min=60, weekly_rsi_min=60):
+    """
+    GFS = Global Filter Screener.
+
+    Filter conditions (both must pass):
+      - Monthly RSI(14) >= monthly_rsi_min   (default 60)
+      - Weekly  RSI(14) >= weekly_rsi_min    (default 60)
+
+    Output per stock (user decides entry from daily RSI):
+      symbol, ltp, ema20_weekly,
+      monthly_rsi, weekly_rsi, daily_rsi,
+      monthly_close, weekly_close,
+      rs_rank, pct_change (daily)
+    """
+    all_fno = read_fno_csv()
+
+    if universe_key == "fno":
+        symbols = all_fno
+    elif universe_key in UNIVERSE_SETS:
+        symbols = [s for s in all_fno if s in UNIVERSE_SETS[universe_key]]
+    elif universe_key == "n500":
+        symbols = all_fno
+    else:
+        return {"error": f"Unknown universe '{universe_key}'"}
+
+    if not symbols:
+        return {"data": [], "count": 0}
+
+    log.info(f"GFS: scanning {len(symbols)} stocks (monthly+weekly+daily)...")
+    t0      = time.time()
+    tickers = [to_yf(s) for s in symbols]
+    multi   = len(tickers) > 1
+
+    # Nifty for RS rank
+    nifty_ret = 0
+    try:
+        nf = yf.download("^NSEI", period="5d", interval="1d",
+                          auto_adjust=True, progress=False, threads=False)
+        if not nf.empty and len(nf) >= 2:
+            nifty_ret = (float(nf["Close"].iloc[-1].iloc[0]) - float(nf["Close"].iloc[-2].iloc[0])) / float(nf["Close"].iloc[-2].iloc[0]) * 100
+    except Exception as e:
+        log.warning(f"GFS nifty: {e}")
+
+    # Fetch all three timeframes in parallel
+    try:
+        monthly = yf.download(tickers, period="5y",  interval="1mo",
+                               group_by="ticker", auto_adjust=True, progress=False, threads=False)
+        weekly  = yf.download(tickers, period="2y",  interval="1wk",
+                               group_by="ticker", auto_adjust=True, progress=False, threads=False)
+        daily   = yf.download(tickers, period="3mo", interval="1d",
+                               group_by="ticker", auto_adjust=True, progress=False, threads=False)
+    except Exception as e:
+        log.error(f"GFS fetch: {e}")
+        return {"error": str(e)}
+
+    def get_df(raw, yf_sym):
+        keys = list(raw.columns.get_level_values(0)) if multi else []
+        if multi:
+            return raw[yf_sym] if yf_sym in keys else pd.DataFrame()
+        return raw if not multi else pd.DataFrame()
+
+    rs_scores = {}
+    results   = []
+
+    for sym in symbols:
+        yf_sym = to_yf(sym)
+        try:
+            df_mo = get_df(monthly, yf_sym).dropna(subset=["Close"])
+            df_wk = get_df(weekly,  yf_sym).dropna(subset=["Close"])
+            df_dy = get_df(daily,   yf_sym).dropna(subset=["Close"])
+
+            # Need enough bars for RSI(14) — monthly needs 15+, weekly 15+, daily 15+
+            if len(df_mo) < 16 or len(df_wk) < 16 or len(df_dy) < 16:
+                continue
+
+            # ── RSI calculations ──────────────────────────────────────────────
+            mo_rsi = _compute_rsi(df_mo["Close"], 14)
+            wk_rsi = _compute_rsi(df_wk["Close"], 14)
+            dy_rsi = _compute_rsi(df_dy["Close"], 14)
+
+            if mo_rsi is None or wk_rsi is None or dy_rsi is None:
+                continue
+
+            # ── Filter ────────────────────────────────────────────────────────
+            if mo_rsi < monthly_rsi_min or wk_rsi < weekly_rsi_min:
+                continue
+
+            # ── Supporting data ───────────────────────────────────────────────
+            ltp         = round(float(df_dy["Close"].iloc[-1]), 2)
+            prev_close  = round(float(df_dy["Close"].iloc[-2]), 2) if len(df_dy) >= 2 else ltp
+            pct_change  = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else 0
+
+            ema20_wk    = _compute_ema(df_wk["Close"], 20)
+            ema20_dy    = _compute_ema(df_dy["Close"], 20)
+
+            mo_close    = round(float(df_mo["Close"].iloc[-1]), 2)
+            wk_close    = round(float(df_wk["Close"].iloc[-1]), 2)
+
+            # Weekly prev high/low (last completed weekly candle)
+            wk_prev_high = round(float(df_wk["High"].iloc[-2]),  2) if len(df_wk) >= 2 else None
+            wk_prev_low  = round(float(df_wk["Low"].iloc[-2]),   2) if len(df_wk) >= 2 else None
+
+            # RS vs Nifty
+            rs_pct = pct_change - nifty_ret
+            rs_scores[sym] = rs_pct
+
+            results.append({
+                "symbol":       sym,
+                "ltp":          ltp,
+                "pct_change":   pct_change,
+                "ema20_weekly": ema20_wk,
+                "ema20_daily":  ema20_dy,
+                "monthly_rsi":  round(mo_rsi, 1),
+                "weekly_rsi":   round(wk_rsi, 1),
+                "daily_rsi":    round(dy_rsi, 1),
+                "wk_prev_high": wk_prev_high,
+                "wk_prev_low":  wk_prev_low,
+                "rs_pct":       round(rs_pct, 2),
+            })
+
+        except Exception as e:
+            log.debug(f"GFS {sym}: {e}")
+            continue
+
+    # RS rank (1 = strongest)
+    ranked      = sorted(rs_scores.items(), key=lambda x: x[1], reverse=True)
+    rs_rank_map = {sym: i + 1 for i, (sym, _) in enumerate(ranked)}
+    for r in results:
+        r["rs_rank"] = rs_rank_map.get(r["symbol"])
+
+    # Sort by monthly RSI desc by default
+    results.sort(key=lambda r: r["monthly_rsi"], reverse=True)
+
+    log.info(f"GFS done in {round(time.time()-t0)}s — {len(results)} qualifying stocks")
+    return {
+        "data":             results,
+        "count":            len(results),
+        "universe":         universe_key,
+        "monthly_rsi_min":  monthly_rsi_min,
+        "weekly_rsi_min":   weekly_rsi_min,
+        "time":             datetime.now().isoformat(),
+    }
+
+
+@app.route("/gfs")
+def gfs():
+    """
+    GFS — Global Filter Screener.
+    Query params:
+      universe        : fno | n50 | nn50 | n200 | n500  (default: fno)
+      monthly_rsi_min : int  (default 60)
+      weekly_rsi_min  : int  (default 60)
+    """
+    try:
+        universe_key    = request.args.get("universe",        "fno").lower()
+        monthly_rsi_min = int(request.args.get("monthly_rsi_min", 60))
+        weekly_rsi_min  = int(request.args.get("weekly_rsi_min",  60))
+        log.info(f"/gfs universe={universe_key} mo>={monthly_rsi_min} wk>={weekly_rsi_min}")
+        result = _run_gfs(universe_key, monthly_rsi_min, weekly_rsi_min)
+        return ok(result)
+    except Exception as e:
+        log.error(f"/gfs: {e}")
+        return ok({"error": str(e)}, 500)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── EXPIRIES ──────────────────────────────────────────────────────────────────
+# Reads expiry list saved by gsheet_bnf.py into Token sheet:
+#   Token!B14 = BNF expiry (single)
+#   Token!B15:B20 = NF expiries (up to 6 weekly Tuesdays)
+# Holiday-aware because gsheet_bnf.py derives dates from Breeze exchange calendar.
+@app.route("/expiries")
+def expiries():
+    symbol   = request.args.get("symbol", "NIFTY").upper()
+    is_nifty = symbol == "NIFTY"
+    try:
+        today  = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        result = []
+
+        if _sh is not None:
+            ws = _sh.worksheet("Token")
+            if is_nifty:
+                vals = ws.col_values(2)          # col B (1-indexed)
+                raw  = [v.strip() for v in vals[14:20] if v and v.strip()]  # B15:B20
+            else:
+                val = ws.acell("B14").value
+                raw = [val.strip()] if val and val.strip() else []
+
+            for e in raw:
+                try:
+                    exp_dt    = datetime.strptime(e, "%Y-%m-%d")
+                    days_left = (exp_dt - today).days
+                    if days_left >= 0:
+                        result.append({
+                            "label":    exp_dt.strftime("%d %b %Y"),
+                            "value":    e,
+                            "daysLeft": days_left,
+                        })
+                except ValueError:
+                    continue
+
+        # Fallback: compute Tuesdays locally if sheet not yet populated
+        if not result:
+            now           = datetime.now()
+            market_closed = now.hour > 15 or (now.hour == 15 and now.minute >= 30)
+            today_str     = now.strftime("%Y-%m-%d")
+            if is_nifty:
+                d = datetime(now.year, now.month, now.day)
+                while d.weekday() != 1:
+                    d += timedelta(days=1)
+                while len(result) < 6:
+                    key = d.strftime("%Y-%m-%d")
+                    if key > today_str or (key == today_str and not market_closed):
+                        dl = (d - today).days
+                        result.append({"label": d.strftime("%d %b %Y"), "value": key, "daysLeft": dl})
+                    d += timedelta(days=7)
+            else:
+                for mo in range(4):
+                    month = now.month + mo
+                    year  = now.year + (month - 1) // 12
+                    month = ((month - 1) % 12) + 1
+                    last  = _calendar.monthrange(year, month)[1]
+                    d     = datetime(year, month, last)
+                    while d.weekday() != 1:
+                        d -= timedelta(days=1)
+                    key = d.strftime("%Y-%m-%d")
+                    if key >= today_str:
+                        dl = (d - today).days
+                        result.append({"label": d.strftime("%d %b %Y"), "value": key, "daysLeft": dl})
+                result = result[:3]
+
+        return ok({"expiries": result})
+    except Exception as e:
+        log.error(f"/expiries error: {e}")
+        return ok({"expiries": [], "error": str(e)}), 500
+
+
+# ── OPTION CHAIN (live via Breeze) ────────────────────────────────────────────
+# GET /option-chain?symbol=NIFTY&expiry=2026-06-09
+# Returns full chain for selected expiry — used by Option Chain tab
+@app.route("/option-chain")
+def option_chain_live():
+    symbol = request.args.get("symbol", "BANKNIFTY").upper().strip()
+    expiry = request.args.get("expiry", "").strip()
+    if not expiry:
+        return ok({"error": "expiry required"}, 400)
+    if symbol not in BREEZE_CODE_MAP:
+        return ok({"error": f"{symbol} not supported"}), 400
+    try:
+        chain, spot = _fetch_breeze_oc(symbol, expiry)
+        step = BREEZE_STEP_MAP.get(symbol, 100)
+        atm  = round(spot / step) * step if spot else None
+        return ok({"symbol": symbol, "expiry": expiry, "spot": spot, "atm": atm, "chain": chain})
+    except Exception as e:
+        log.error(f"/option-chain: {e}")
+        return ok({"error": str(e), "chain": [], "spot": None}), 500
+
+
+# ── OPTION LTP (live via Breeze) ──────────────────────────────────────────────
+# GET /option_ltp?symbol=BANKNIFTY&expiry=2026-06-30&strikes=54500,54600
+# Used by StrategyBuilder journal for live P&L
+@app.route("/option_ltp")
+def option_ltp():
+    symbol  = request.args.get("symbol",  "").upper().strip()
+    expiry  = request.args.get("expiry",  "").strip()
+    strikes = request.args.get("strikes", "").strip()
+    if not symbol or symbol not in BREEZE_CODE_MAP:
+        return ok({"error": f"{symbol} not supported"}), 400
+    if not expiry:
+        return ok({"error": "expiry required"}), 400
+    try:
+        chain, spot = _fetch_breeze_oc(symbol, expiry)
+        if not chain:
+            return ok({"error": "No data from Breeze", "spot": None, "data": {}})
+        # Build strike map
+        all_strikes = {str(r["strike"]): {"ce": r["ce_ltp"], "pe": r["pe_ltp"]} for r in chain}
+        if strikes:
+            requested = [str(int(s.strip())) for s in strikes.split(",") if s.strip()]
+            result    = {s: all_strikes.get(s, {"ce": None, "pe": None}) for s in requested}
+        else:
+            result = all_strikes
+        return ok({"symbol": symbol, "expiry": expiry, "spot": spot, "data": result})
+    except Exception as e:
+        log.error(f"/option_ltp: {e}")
+        return ok({"error": str(e), "spot": None, "data": {}}), 500
+
+
+
 if __name__ == "__main__":
     connect_sheets()
+    _init_breeze()
     _preload_cache_from_sheets()
 
     threading.Thread(target=_bg_loop,   daemon=True, name="bg-screener").start()
