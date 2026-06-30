@@ -17,6 +17,7 @@ Endpoints:
   GET  /expiries        -> upcoming expiry dates (from Token!B14:B20, written by gsheet_bnf.py)
   GET  /option-chain    -> live option chain via Breeze API
   GET  /option_ltp      -> CE/PE LTP for specific strikes via Breeze API
+  GET  /stock-ranks     -> Momentum + Retracement ranking from DailyShortlist tab
 
 Run:
     pip install flask yfinance flask-cors pandas gspread google-auth pytz
@@ -28,6 +29,7 @@ from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import json, math, os, time, logging, threading, urllib.request, calendar as _calendar
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from breeze_connect import BreezeConnect
 
@@ -317,6 +319,42 @@ def _compute_ema(series, period=20):
     val = ema.iloc[-1]
     return round(float(val), 2) if not math.isnan(val) else None
 
+# ── ADX scalar ────────────────────────────────────────────────────────────────
+def _compute_adx(high, low, close, period=14):
+    if high is None or len(high) < period * 2:
+        return None
+    h, l, c = high, low, close
+    tr  = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs(),
+    ], axis=1).max(axis=1)
+    up_move   = h.diff()
+    down_move = -l.diff()
+    plus_dm   = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm  = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr       = tr.ewm(com=period - 1, min_periods=period).mean()
+    plus_di   = 100 * plus_dm.ewm(com=period - 1, min_periods=period).mean() / atr
+    minus_di  = 100 * minus_dm.ewm(com=period - 1, min_periods=period).mean() / atr
+    dx        = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("inf"))
+    adx       = dx.ewm(com=period - 1, min_periods=period).mean()
+    val       = adx.iloc[-1]
+    return round(float(val), 2) if not math.isnan(val) else None
+
+def _compute_atr(high, low, close, period=14):
+    """Average True Range (Wilder smoothing) — absolute volatility in price units."""
+    if high is None or len(high) < period + 1:
+        return None
+    h, l, c = high, low, close
+    tr  = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(com=period - 1, min_periods=period).mean()
+    val = atr.iloc[-1]
+    return round(float(val), 2) if not math.isnan(val) else None
+
 # ── Divergence detector ───────────────────────────────────────────────────────
 def _compute_divergence(t_df, lookback=12):
     """
@@ -518,31 +556,23 @@ def _run_swing_fetch(universe_key, tf_key):
     except Exception as e:
         log.warning(f"swing nifty: {e}")
 
-    # ── Trade TF batch fetch ──────────────────────────────────────────────────
-    log.info(f"swing: fetching trade TF ({trade_interval})...")
+    # ── Trade TF + Lower TF batch fetch, run concurrently ──
+    # These two yf.download calls are independent — parallelizing them
+    # roughly halves wall-clock time vs the old sequential approach.
+    log.info(f"swing: fetching trade TF ({trade_interval}) + lower TF ({lower_interval}) concurrently...")
     t0 = time.time()
     try:
-        trade_raw = yf.download(
-            tickers, period=trade_period, interval=trade_interval,
-            group_by="ticker", auto_adjust=True, progress=False, threads=False
-        )
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_trade = ex.submit(yf.download, tickers, period=trade_period, interval=trade_interval,
+                                   group_by="ticker", auto_adjust=True, progress=False, threads=False)
+            fut_lower = ex.submit(yf.download, tickers, period=lower_period, interval=lower_interval,
+                                   group_by="ticker", auto_adjust=True, progress=False, threads=False)
+            trade_raw = fut_trade.result()
+            lower_raw = fut_lower.result()
     except Exception as e:
-        log.error(f"swing trade fetch: {e}")
+        log.error(f"swing parallel fetch: {e}")
         return {"error": str(e)}
-    log.info(f"swing: trade TF done in {round(time.time()-t0)}s")
-
-    # ── Lower TF batch fetch ──────────────────────────────────────────────────
-    log.info(f"swing: fetching lower TF ({lower_interval})...")
-    t0 = time.time()
-    try:
-        lower_raw = yf.download(
-            tickers, period=lower_period, interval=lower_interval,
-            group_by="ticker", auto_adjust=True, progress=False, threads=False
-        )
-    except Exception as e:
-        log.error(f"swing lower fetch: {e}")
-        return {"error": str(e)}
-    log.info(f"swing: lower TF done in {round(time.time()-t0)}s")
+    log.info(f"swing: both TFs done in {round(time.time()-t0)}s (parallel)")
 
     trade_keys = list(trade_raw.columns.get_level_values(0)) if (multi and not trade_raw.empty) else []
     lower_keys = list(lower_raw.columns.get_level_values(0)) if (multi and not lower_raw.empty) else []
@@ -677,12 +707,20 @@ def quotes():
         tickers = [to_yf(s) for s in symbols]
         log.info(f"Fetching {len(tickers)} tickers...")
 
-        raw   = yf.download(tickers, period="1d",  interval="1m",
-                            group_by="ticker", auto_adjust=True,
-                            progress=False, threads=False)
-        daily = yf.download(tickers, period="30d", interval="1d",
-                            group_by="ticker", auto_adjust=True,
-                            progress=False, threads=False)
+        # ── Run intraday (1m) and daily (30d) fetches concurrently ──
+        # These are independent network calls — running them in parallel
+        # roughly halves wall-clock time vs the old sequential approach.
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_raw   = ex.submit(yf.download, tickers, period="1d",  interval="1m",
+                                   group_by="ticker", auto_adjust=True,
+                                   progress=False, threads=False)
+            fut_daily = ex.submit(yf.download, tickers, period="30d", interval="1d",
+                                   group_by="ticker", auto_adjust=True,
+                                   progress=False, threads=False)
+            raw   = fut_raw.result()
+            daily = fut_daily.result()
+        log.info(f"/quotes: parallel fetch done in {round(time.time()-t0)}s")
 
         multi      = len(tickers) > 1
         raw_cols   = list(raw.columns.get_level_values(0))   if multi and not raw.empty   else []
@@ -982,12 +1020,16 @@ def _fetch_quotes_batch(symbols):
     multi   = len(tickers) > 1
     results = {}
     try:
-        raw   = yf.download(tickers, period="1d",  interval="1m",
-                            group_by="ticker", auto_adjust=True,
-                            progress=False, threads=False)
-        daily = yf.download(tickers, period="30d", interval="1d",
-                            group_by="ticker", auto_adjust=True,
-                            progress=False, threads=False)
+        # Run intraday + daily fetches concurrently (same pattern as /quotes and /swing)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_raw   = ex.submit(yf.download, tickers, period="1d",  interval="1m",
+                                   group_by="ticker", auto_adjust=True,
+                                   progress=False, threads=False)
+            fut_daily = ex.submit(yf.download, tickers, period="30d", interval="1d",
+                                   group_by="ticker", auto_adjust=True,
+                                   progress=False, threads=False)
+            raw   = fut_raw.result()
+            daily = fut_daily.result()
         raw_cols   = list(raw.columns.get_level_values(0))   if multi and not raw.empty   else []
         daily_cols = list(daily.columns.get_level_values(0)) if multi and not daily.empty else []
 
@@ -1432,7 +1474,228 @@ def _keep_warm():
 # Daily RSI shown as-is for user decision
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _run_gfs(universe_key, monthly_rsi_min=60, weekly_rsi_min=60):
+def _read_daily_shortlist():
+    """
+    Reads the DailyShortlist tab: Column A = Bullish symbols, Column B = Bearish.
+    No header row. Returns (bull_list, bear_list).
+    """
+    if _sh is None:
+        return [], []
+    try:
+        ws = _sh.worksheet("DailyShortlist")
+    except Exception as e:
+        log.warning(f"DailyShortlist tab not found: {e}")
+        return [], []
+
+    col_a = ws.col_values(1)  # Bullish
+    col_b = ws.col_values(2)  # Bearish
+
+    bulls = [s.strip().upper() for s in col_a if s.strip()]
+    bears = [s.strip().upper() for s in col_b if s.strip()]
+    return bulls, bears
+
+
+def _attach_live_cmp(results):
+    """
+    Fetches today's live/last-traded price for each scored symbol via yfinance
+    fast_info, and attaches it as 'cmp'. Best-effort: if a symbol's live quote
+    fails, falls back to its prior EOD close (already in 'ltp') so the UI
+    never shows a blank value. This never touches the RSI/EMA/ADX scores
+    above — those remain based on completed daily candles only.
+    """
+    if not results:
+        return
+    tickers = [to_yf(r["symbol"]) for r in results]
+    try:
+        live = yf.Tickers(" ".join(tickers))
+    except Exception as e:
+        log.warning(f"StockRanker _attach_live_cmp Tickers() failed: {e}")
+        for r in results:
+            r["cmp"] = r["ltp"]
+        return
+
+    for r in results:
+        yf_sym = to_yf(r["symbol"])
+        try:
+            tk = live.tickers.get(yf_sym)
+            px = None
+            if tk is not None:
+                fi = getattr(tk, "fast_info", None)
+                if fi:
+                    px = fi.get("last_price") or fi.get("lastPrice")
+            r["cmp"] = round(float(px), 2) if px else r["ltp"]
+        except Exception:
+            r["cmp"] = r["ltp"]
+
+
+def _run_stock_ranker():
+    """
+    Fetches EOD data for DailyShortlist symbols, computes RSI(14), EMA(20/50),
+    ADX(14) on previous day's close, and scores each stock for:
+      - Momentum  (trend strength: RSI + EMA alignment + ADX)
+      - Retracement (pullback quality: proximity to 20 EMA + RSI cool-off)
+    Ignores current day's intraday movement — uses prior completed daily candles only.
+    """
+    bulls, bears = _read_daily_shortlist()
+    if not bulls and not bears:
+        return {"error": "DailyShortlist tab empty or not found", "data": []}
+
+    all_syms = [(s, "bull") for s in bulls] + [(s, "bear") for s in bears]
+    tickers  = [to_yf(s) for s,_ in all_syms]
+    multi    = len(tickers) > 1
+
+    log.info(f"StockRanker: scanning {len(all_syms)} stocks (bull={len(bulls)}, bear={len(bears)})...")
+    t0 = time.time()
+
+    try:
+        daily = yf.download(tickers, period="120d", interval="1d",
+                             group_by="ticker", auto_adjust=True,
+                             progress=False, threads=False)
+    except Exception as e:
+        log.error(f"StockRanker fetch: {e}")
+        return {"error": str(e), "data": []}
+
+    def get_df(yf_sym):
+        if multi:
+            keys = list(daily.columns.get_level_values(0))
+            return daily[yf_sym] if yf_sym in keys else pd.DataFrame()
+        return daily
+
+    results = []
+    for sym, bias in all_syms:
+        yf_sym = to_yf(sym)
+        try:
+            df = get_df(yf_sym).dropna(subset=["Close"])
+            if len(df) < 55:
+                continue
+
+            # Drop today's candle if market is currently open (use prior close only)
+            if _is_market_hours() and len(df) > 0:
+                last_date = df.index[-1].date()
+                if last_date == datetime.now().date():
+                    df = df.iloc[:-1]
+            if len(df) < 55:
+                continue
+
+            close = df["Close"]
+            high  = df["High"]
+            low   = df["Low"]
+
+            ltp        = float(close.iloc[-1])
+            prev       = float(close.iloc[-2])
+            pct_change = round((ltp - prev) / prev * 100, 2) if prev else 0
+
+            rsi   = _compute_rsi(close, 14)
+            ema20 = _compute_ema(close, 20)
+            ema50 = _compute_ema(close, 50)
+            adx   = _compute_adx(high, low, close, 14)
+            atr   = _compute_atr(high, low, close, 14)
+
+            if rsi is None or ema20 is None or ema50 is None:
+                continue
+
+            dist_ema20 = round((ltp - ema20) / ema20 * 100, 2)
+            adx_val    = adx or 0
+
+            # ── Momentum score (0-100) ──
+            if bias == "bull":
+                rsi_m = 100 if rsi >= 70 else (60 + (rsi-60)*4 if rsi >= 60 else (20 if rsi >= 50 else 0))
+                ema_m = 100 if (ltp > ema20 > ema50) else (60 if ltp > ema20 else (30 if ltp > ema50 else 0))
+            else:
+                rsi_m = 100 if rsi <= 30 else (60 + (40-rsi)*4 if rsi <= 40 else (20 if rsi <= 50 else 0))
+                ema_m = 100 if (ltp < ema20 < ema50) else (60 if ltp < ema20 else (30 if ltp < ema50 else 0))
+            adx_s     = 100 if adx_val >= 30 else (70 if adx_val >= 25 else (40 if adx_val >= 20 else 10))
+            mom_score = round(rsi_m * 0.35 + ema_m * 0.35 + adx_s * 0.30, 1)
+
+            # ── Retracement score (0-100) ──
+            if bias == "bull":
+                struct = 100 if ltp > ema50 else 0
+                if dist_ema20 >= 0:
+                    prox = 100 if dist_ema20 <= 2 else (70 if dist_ema20 <= 4 else (40 if dist_ema20 <= 7 else 10))
+                else:
+                    prox = 20
+                rsi_c = 100 if 50 <= rsi <= 65 else (60 if 40 <= rsi < 50 else (50 if 65 < rsi <= 75 else (10 if rsi > 75 else 20)))
+            else:
+                struct = 100 if ltp < ema50 else 0
+                if dist_ema20 <= 0:
+                    prox = 100 if dist_ema20 >= -2 else (70 if dist_ema20 >= -4 else (40 if dist_ema20 >= -7 else 10))
+                else:
+                    prox = 20
+                rsi_c = 100 if 35 <= rsi <= 50 else (60 if 50 < rsi <= 60 else (50 if 25 <= rsi < 35 else (10 if rsi < 25 else 20)))
+            ret_score = round(struct * 0.30 + prox * 0.45 + rsi_c * 0.25, 1)
+
+            results.append({
+                "symbol":      sym,
+                "bias":        bias,
+                "ltp":         round(ltp, 2),
+                "prev_close":  round(prev, 2),
+                "cmp":         None,  # filled in below via live batch quote
+                "pct_change":  pct_change,
+                "rsi":         round(rsi, 1),
+                "ema20":       round(ema20, 2),
+                "ema50":       round(ema50, 2),
+                "adx":         round(adx_val, 1),
+                "atr":         atr,
+                "dist_ema20":  dist_ema20,
+                "mom_score":   mom_score,
+                "ret_score":   ret_score,
+            })
+        except Exception as e:
+            log.debug(f"StockRanker {sym}: {e}")
+            continue
+
+    # ── Live CMP (best-effort, on-demand, never blocks scoring) ──
+    try:
+        _attach_live_cmp(results)
+    except Exception as e:
+        log.warning(f"StockRanker live CMP fetch failed: {e}")
+        # Fall back: CMP = prior EOD close so the column is never blank
+        for r in results:
+            if r["cmp"] is None:
+                r["cmp"] = r["ltp"]
+
+    log.info(f"StockRanker done in {round(time.time()-t0)}s — {len(results)}/{len(all_syms)} scored")
+
+    # Optional: write results back to a StockRanks tab for history
+    try:
+        if _sh is not None and results:
+            _write_stock_ranks(results)
+    except Exception as e:
+        log.warning(f"StockRanker sheet write failed: {e}")
+
+    return {
+        "data":   results,
+        "count":  len(results),
+        "bulls":  len(bulls),
+        "bears":  len(bears),
+        "time":   datetime.now().isoformat(),
+    }
+
+
+def _write_stock_ranks(results):
+    """Writes scored results to the StockRanks tab (creates it if missing)."""
+    import gspread
+    try:
+        ws = _sh.worksheet("StockRanks")
+    except gspread.WorksheetNotFound:
+        ws = _sh.add_worksheet(title="StockRanks", rows=200, cols=15)
+
+    headers = ["Symbol","Bias","CMP","PrevClose","Chg%","RSI","EMA20","EMA50","ADX","ATR",
+               "Dist20EMA%","MomScore","RetScore","Timestamp"]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = [headers]
+    for r in results:
+        rows.append([
+            r["symbol"], r["bias"], r.get("cmp", r["ltp"]), r["prev_close"], r["pct_change"], r["rsi"],
+            r["ema20"], r["ema50"], r["adx"], r.get("atr"), r["dist_ema20"],
+            r["mom_score"], r["ret_score"], ts
+        ])
+    ws.clear()
+    ws.update("A1", rows)
+    log.info(f"StockRanks: wrote {len(results)} rows to sheet")
+
+
+
     """
     GFS = Global Filter Screener.
 
@@ -1574,6 +1837,21 @@ def _run_gfs(universe_key, monthly_rsi_min=60, weekly_rsi_min=60):
         "weekly_rsi_min":   weekly_rsi_min,
         "time":             datetime.now().isoformat(),
     }
+
+
+@app.route("/stock-ranks")
+def stock_ranks():
+    """
+    Reads bull/bear symbols from the DailyShortlist tab, fetches EOD data,
+    computes momentum + retracement scores. Ignores today's intraday movement.
+    Also writes results to the StockRanks tab for history.
+    """
+    try:
+        result = _run_stock_ranker()
+        return ok(result)
+    except Exception as e:
+        log.error(f"/stock-ranks: {e}")
+        return ok({"error": str(e), "data": []}, 500)
 
 
 @app.route("/gfs")
