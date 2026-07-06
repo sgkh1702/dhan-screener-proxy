@@ -276,7 +276,9 @@ def ok(data, status=200):
 
 # ── Market hours guard ─────────────────────────────────────────────────────────
 def _is_market_hours():
-    import pytz, datetime as _dt
+    import os, pytz, datetime as _dt
+    if os.environ.get("SKIP_MARKET_HOURS_CHECK", "").lower() in ("1", "true", "yes"):
+        return True
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)
     if now.weekday() >= 5:
@@ -1428,9 +1430,10 @@ def _bg_run_once():
 
         # ── ORB ───────────────────────────────────────────────────────────────
         try:
-            import pytz as _pytz2, datetime as _dt2
+            import os as _os2, pytz as _pytz2, datetime as _dt2
+            _skip_gate = _os2.environ.get("SKIP_MARKET_HOURS_CHECK", "").lower() in ("1", "true", "yes")
             _now_ist = datetime.now(_pytz2.timezone("Asia/Kolkata"))
-            if _now_ist.time() >= _dt2.time(9, 30):
+            if _skip_gate or _now_ist.time() >= _dt2.time(9, 30):
                 with _orb_lock:
                     _need_p1 = (_orb_date != date_str or not _orb_shortlist)
                 if _need_p1:
