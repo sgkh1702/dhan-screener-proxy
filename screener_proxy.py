@@ -32,6 +32,7 @@ import json, math, os, time, logging, threading, urllib.request, calendar as _ca
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from breeze_connect import BreezeConnect
+from breeze_symbol_map import NSE_TO_BREEZE
 
 app = Flask(__name__)
 CORS(app)
@@ -106,6 +107,48 @@ def _get_breeze():
     if _breeze is None or (time.time() - _breeze_ts) > BREEZE_TTL:
         _init_breeze()
     return _breeze
+
+def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type="cash"):
+    """
+    Fetch historical candles from Breeze and return a DataFrame indexed by
+    IST datetime with Open/High/Low/Close float columns (sorted ascending).
+    interval: "1minute", "5minute", "30minute", or "1day".
+    Returns an empty DataFrame on any failure (missing session, no data, etc).
+    """
+    import pytz as _pytz_bc
+    breeze = _get_breeze()
+    if not breeze or not breeze_code:
+        return pd.DataFrame()
+    try:
+        from_utc = from_dt_ist.astimezone(_pytz_bc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        to_utc   = to_dt_ist.astimezone(_pytz_bc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        resp = breeze.get_historical_data_v2(
+            interval=interval, from_date=from_utc, to_date=to_utc,
+            stock_code=breeze_code, exchange_code="NSE", product_type=product_type,
+        )
+        recs = resp.get("Success") or []
+        if not recs:
+            return pd.DataFrame()
+        df = pd.DataFrame(recs)
+        dt_col = next((c for c in df.columns if c.lower() == "datetime"), None)
+        if dt_col is None:
+            return pd.DataFrame()
+        ts = pd.to_datetime(df[dt_col])
+        if ts.dt.tz is None:
+            ts = ts.dt.tz_localize("UTC")
+        df.index = ts.dt.tz_convert(_pytz_bc.timezone("Asia/Kolkata"))
+        cols = {c.lower(): c for c in df.columns}
+        out = pd.DataFrame({
+            "Open":  df[cols["open"]].astype(float),
+            "High":  df[cols["high"]].astype(float),
+            "Low":   df[cols["low"]].astype(float),
+            "Close": df[cols["close"]].astype(float),
+        }).sort_index()
+        return out
+    except Exception as e:
+        log.debug(f"Breeze candles fetch {breeze_code} {interval}: {e}")
+        return pd.DataFrame()
+
 
 # Breeze stock codes for indices
 BREEZE_CODE_MAP = {
@@ -1144,74 +1187,84 @@ def _write_to_sheet(rows, date_str, time_str):
         log.error(f"_write_to_sheet: {e}")
 
 
+def _p1_orb_worker(sym, ist, today, now):
+    """
+    Build one symbol's ORB shortlist entry from Breeze data, or return None
+    if the symbol isn't mappable / doesn't qualify as a setup.
+    Opening range = first 3 five-min candles of the day (9:15-9:30), which
+    is the true opening 15 minutes — Breeze has no native 15-min interval.
+    """
+    import datetime as _dt
+    breeze_code = NSE_TO_BREEZE.get(sym)
+    if not breeze_code:
+        return None
+    try:
+        daily_df = _breeze_candles(breeze_code, "1day", now - timedelta(days=35), now)
+        if daily_df.empty or len(daily_df) < 2:
+            return None
+        pdh        = float(daily_df["High"].iloc[-2])
+        pdl        = float(daily_df["Low"].iloc[-2])
+        prev_close = float(daily_df["Close"].iloc[-2])
+
+        hi, lo, cl = daily_df["High"], daily_df["Low"], daily_df["Close"]
+        tr = pd.concat([hi - lo, (hi - cl.shift(1)).abs(), (lo - cl.shift(1)).abs()],
+                        axis=1).max(axis=1).dropna()
+        atr = round(float(tr.tail(min(14, len(tr))).mean()), 2) if len(tr) >= 1 else None
+
+        day_start = ist.localize(_dt.datetime.combine(today, _dt.time(9, 15)))
+        m5_today  = _breeze_candles(breeze_code, "5minute", day_start, now)
+        if m5_today.empty or len(m5_today) < 3:
+            return None  # opening range not fully formed yet
+
+        opening  = m5_today.iloc[:3]  # 9:15-9:20, 9:20-9:25, 9:25-9:30 candles
+        orb_high = round(float(opening["High"].max()), 2)
+        orb_low  = round(float(opening["Low"].min()),  2)
+        orb_open = round(float(opening["Open"].iloc[0]), 2)
+        gap_pct  = round((orb_open - prev_close) / prev_close * 100, 2) if prev_close else 0
+
+        bull_setup = orb_high > pdh
+        bear_setup = orb_low  < pdl
+        if not bull_setup and not bear_setup:
+            return None
+
+        return sym, {
+            "orb_high": orb_high, "orb_low": orb_low, "orb_open": orb_open,
+            "pdh": round(pdh, 2), "pdl": round(pdl, 2), "prev_close": round(prev_close, 2),
+            "atr": atr, "gap_pct": gap_pct,
+            "bull_setup": bull_setup, "bear_setup": bear_setup,
+        }
+    except Exception as e:
+        log.debug(f"ORB P1 {sym}: {e}")
+        return None
+
+
 def _build_orb_shortlist(symbols, date_str):
     global _orb_shortlist, _orb_date, _orb_results
     import pytz
     ist   = pytz.timezone("Asia/Kolkata")
-    today = datetime.now(ist).date()
+    now   = datetime.now(ist)
+    today = now.date()
 
     with _orb_lock:
         if _orb_date == date_str and _orb_shortlist:
             return
 
-    log.info(f"ORB Phase 1: scanning {len(symbols)} stocks...")
+    mappable = [s for s in symbols if s in NSE_TO_BREEZE]
+    skipped  = len(symbols) - len(mappable)
+    if skipped:
+        log.info(f"ORB Phase 1: {skipped} symbols have no Breeze code mapping, skipping")
+
+    log.info(f"ORB Phase 1: scanning {len(mappable)} stocks via Breeze...")
     t0 = time.time()
     try:
-        tickers  = [to_yf(s) for s in symbols]
-        m15      = yf.download(tickers, period="2d",  interval="15m",
-                               group_by="ticker", auto_adjust=True, progress=False, threads=False)
-        daily    = yf.download(tickers, period="30d", interval="1d",
-                               group_by="ticker", auto_adjust=True, progress=False, threads=False)
-        multi    = len(tickers) > 1
-        m15_keys = list(m15.columns.get_level_values(0))   if (multi and not m15.empty)   else []
-        d_keys   = list(daily.columns.get_level_values(0)) if (multi and not daily.empty) else []
-
         shortlist = {}
-        for sym in symbols:
-            yf_sym = to_yf(sym)
-            try:
-                df15   = m15[yf_sym]   if (multi and yf_sym in m15_keys) else (m15   if not multi else pd.DataFrame())
-                day_df = daily[yf_sym] if (multi and yf_sym in d_keys)   else (daily if not multi else pd.DataFrame())
-                if df15.empty or day_df.empty or len(day_df) < 2:
-                    continue
-
-                pdh        = float(day_df["High"].iloc[-2])
-                pdl        = float(day_df["Low"].iloc[-2])
-                prev_close = float(day_df["Close"].iloc[-2])
-                atr = None
-                hi = day_df["High"]; lo = day_df["Low"]; cl = day_df["Close"]
-                tr = pd.concat([hi-lo,(hi-cl.shift(1)).abs(),(lo-cl.shift(1)).abs()],axis=1).max(axis=1).dropna()
-                if len(tr) >= 1:
-                    atr = round(float(tr.tail(min(14,len(tr))).mean()), 2)
-
-                df15.index = pd.to_datetime(df15.index)
-                if df15.index.tzinfo is not None:
-                    _dates = [d.astimezone(ist).date() for d in df15.index]
-                else:
-                    _dates = [d.date() for d in df15.index]
-                today_15m = df15[[d == today for d in _dates]]
-                if today_15m.empty:
-                    continue
-
-                c1       = today_15m.iloc[0]
-                orb_high = round(float(c1["High"]),  2)
-                orb_low  = round(float(c1["Low"]),   2)
-                orb_open = round(float(c1["Open"]),  2)
-                gap_pct  = round((orb_open - prev_close) / prev_close * 100, 2) if prev_close else 0
-
-                bull_setup = orb_high > pdh
-                bear_setup = orb_low  < pdl
-                if not bull_setup and not bear_setup:
-                    continue
-
-                shortlist[sym] = {
-                    "orb_high": orb_high, "orb_low": orb_low, "orb_open": orb_open,
-                    "pdh": round(pdh,2), "pdl": round(pdl,2), "prev_close": round(prev_close,2),
-                    "atr": atr, "gap_pct": gap_pct,
-                    "bull_setup": bull_setup, "bear_setup": bear_setup,
-                }
-            except Exception as e:
-                log.debug(f"ORB P1 {sym}: {e}")
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(_p1_orb_worker, sym, ist, today, now) for sym in mappable]
+            for fut in futures:
+                res = fut.result()
+                if res:
+                    sym, entry = res
+                    shortlist[sym] = entry
 
         with _orb_lock:
             _orb_shortlist = shortlist
@@ -1225,129 +1278,101 @@ def _build_orb_shortlist(symbols, date_str):
         log.error(f"_build_orb_shortlist: {e}")
 
 
+def _p2_orb_worker(sym, orb, ist, today, now, all_quotes):
+    """
+    Check one symbol's breakout status against its ORB range using Breeze
+    5-min candles, from the first candle after the opening range (9:30)
+    through the latest available candle — no fixed cutoff window.
+    """
+    import datetime as _dt
+    breeze_code = NSE_TO_BREEZE.get(sym)
+    q        = all_quotes.get(sym, {})
+    ltp      = q.get("ltp",  0) or 0
+    day_high = q.get("high", 0) or 0
+    day_low  = q.get("low",  0) or 0
+    atr      = orb.get("atr") or q.get("atr")
+    atr_consumed = round(abs(ltp - orb["orb_open"]) / atr * 100, 1) if atr else None
+    orb_high = orb["orb_high"]
+    orb_low  = orb["orb_low"]
+
+    bull_trigger_candle = None
+    bear_trigger_candle = None
+
+    try:
+        if breeze_code:
+            day_start = ist.localize(_dt.datetime.combine(today, _dt.time(9, 15)))
+            df5 = _breeze_candles(breeze_code, "5minute", day_start, now)
+            if not df5.empty:
+                post_open = df5[df5.index.time >= _dt.time(9, 30)]
+                candles_all = [(i + 1, post_open.iloc[i]) for i in range(len(post_open))]
+
+                if orb["bull_setup"]:
+                    for candle_num, candle in candles_all:
+                        if float(candle["High"]) > orb_high:
+                            bull_trigger_candle = candle_num; break
+                if orb["bear_setup"]:
+                    for candle_num, candle in candles_all:
+                        if float(candle["Low"]) < orb_low:
+                            bear_trigger_candle = candle_num; break
+    except Exception as e:
+        log.debug(f"ORB P2 {sym}: {e}")
+
+    bull_status = None
+    if orb["bull_setup"]:
+        if bull_trigger_candle is not None:
+            bull_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+        elif day_low < orb_low:
+            bull_status = "Failed"
+        else:
+            bull_status = "Watching"
+
+    bear_status = None
+    if orb["bear_setup"]:
+        if bear_trigger_candle is not None:
+            bear_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+        elif day_high > orb_high:
+            bear_status = "Failed"
+        else:
+            bear_status = "Watching"
+
+    orb_range   = orb_high - orb_low
+    bull_target = round(orb_high + (atr or 0), 2) if orb["bull_setup"] else None
+    bear_target = round(orb_low  - (atr or 0), 2) if orb["bear_setup"] else None
+    bull_rr     = round((bull_target - orb_high) / orb_range, 2) if (orb["bull_setup"] and orb_range > 0 and bull_target) else None
+    bear_rr     = round((orb_low - bear_target)  / orb_range, 2) if (orb["bear_setup"] and orb_range > 0 and bear_target) else None
+
+    return sym, {
+        "symbol": sym, "ltp": ltp, "day_high": day_high, "day_low": day_low,
+        "atr": atr, "atr_consumed": atr_consumed,
+        "bull_setup": orb["bull_setup"], "bear_setup": orb["bear_setup"],
+        "bull_status": bull_status, "bull_stop": orb_low, "bull_target": bull_target,
+        "bull_rr": bull_rr, "bull_trigger_candle": bull_trigger_candle,
+        "bear_status": bear_status, "bear_stop": orb_high, "bear_target": bear_target,
+        "bear_rr": bear_rr, "bear_trigger_candle": bear_trigger_candle,
+    }
+
+
 def _update_orb_status(all_quotes, date_str):
-    import pytz, datetime as _dt
+    import pytz
     ist   = pytz.timezone("Asia/Kolkata")
-    today = datetime.now(ist).date()
+    now   = datetime.now(ist)
+    today = now.date()
 
     with _orb_lock:
         shortlist = dict(_orb_shortlist)
     if not shortlist:
         return
 
-    syms    = list(shortlist.keys())
-    tickers = [to_yf(s) for s in syms]
-    multi   = len(tickers) > 1
-
-    try:
-        m5 = yf.download(tickers, period="1d", interval="5m",
-                         group_by="ticker", auto_adjust=True, progress=False, threads=False)
-    except Exception as e:
-        log.error(f"ORB Phase 2 5m fetch: {e}")
-        return
-
-    m5_keys = list(m5.columns.get_level_values(0)) if (multi and not m5.empty) else []
     results = {}
-
-    for sym, orb in shortlist.items():
-        yf_sym = to_yf(sym)
-        q        = all_quotes.get(sym, {})
-        ltp      = q.get("ltp",  0) or 0
-        day_high = q.get("high", 0) or 0
-        day_low  = q.get("low",  0) or 0
-        atr      = orb.get("atr") or q.get("atr")
-        atr_consumed = round(abs(ltp - orb["orb_open"]) / atr * 100, 1) if atr else None
-        orb_high = orb["orb_high"]
-        orb_low  = orb["orb_low"]
-
-        bull_trigger_candle = None
-        bear_trigger_candle = None
-        bull_breakout_any_candle = None
-        bear_breakout_any_candle = None
-        latest_candle_num = 0
-
-        try:
-            df5 = (m5[yf_sym] if (multi and yf_sym in m5_keys) else (m5 if not multi else pd.DataFrame()))
-            if not df5.empty:
-                df5 = df5.dropna(subset=["Close"])
-                df5.index = pd.to_datetime(df5.index)
-                if df5.index.tzinfo is not None:
-                    idx_ist = [ts.astimezone(ist) for ts in df5.index]
-                else:
-                    import pytz as _pytz2
-                    idx_ist = [_pytz2.utc.localize(ts).astimezone(ist) for ts in df5.index]
-
-                c1_start = _dt.time(9, 30)
-                candles_all = [
-                    (idx+1, df5.iloc[i])
-                    for i, (ts, idx) in enumerate(zip(idx_ist, range(len(idx_ist))))
-                    if ts.date() == today and ts.time() >= c1_start
-                ]
-                candles_window = [c for c in candles_all if c[0] in (2, 3, 4)]  # entry window C2/C3/C4
-                latest_candle_num = candles_all[-1][0] if candles_all else 0
-
-                if orb["bull_setup"]:
-                    for candle_num, candle in candles_window:
-                        if float(candle["High"]) > orb_high:
-                            bull_trigger_candle = candle_num; break
-                    if bull_trigger_candle is None:
-                        for candle_num, candle in candles_all:
-                            if float(candle["High"]) > orb_high:
-                                bull_breakout_any_candle = candle_num; break
-                if orb["bear_setup"]:
-                    for candle_num, candle in candles_window:
-                        if float(candle["Low"]) < orb_low:
-                            bear_trigger_candle = candle_num; break
-                    if bear_trigger_candle is None:
-                        for candle_num, candle in candles_all:
-                            if float(candle["Low"]) < orb_low:
-                                bear_breakout_any_candle = candle_num; break
-        except Exception as e:
-            log.debug(f"ORB P2 {sym}: {e}")
-
-        window_closed = latest_candle_num > 4
-
-        bull_status = None
-        if orb["bull_setup"]:
-            if bull_trigger_candle is not None:
-                bull_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
-            elif bull_breakout_any_candle is not None:
-                bull_status = "Missed"  # broke out, but after C2/C3/C4 window
-            elif day_low < orb_low:
-                bull_status = "Failed"
-            elif window_closed:
-                bull_status = "Missed"  # window closed, never broke out
-            else:
-                bull_status = "Watching"
-
-        bear_status = None
-        if orb["bear_setup"]:
-            if bear_trigger_candle is not None:
-                bear_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
-            elif bear_breakout_any_candle is not None:
-                bear_status = "Missed"  # broke out, but after C2/C3/C4 window
-            elif day_high > orb_high:
-                bear_status = "Failed"
-            elif window_closed:
-                bear_status = "Missed"  # window closed, never broke out
-            else:
-                bear_status = "Watching"
-
-        orb_range   = orb_high - orb_low
-        bull_target = round(orb_high + (atr or 0), 2) if orb["bull_setup"] else None
-        bear_target = round(orb_low  - (atr or 0), 2) if orb["bear_setup"] else None
-        bull_rr     = round((bull_target - orb_high) / orb_range, 2) if (orb["bull_setup"] and orb_range > 0 and bull_target) else None
-        bear_rr     = round((orb_low - bear_target)  / orb_range, 2) if (orb["bear_setup"] and orb_range > 0 and bear_target) else None
-
-        results[sym] = {
-            "symbol": sym, "ltp": ltp, "day_high": day_high, "day_low": day_low,
-            "atr": atr, "atr_consumed": atr_consumed,
-            "bull_setup": orb["bull_setup"], "bear_setup": orb["bear_setup"],
-            "bull_status": bull_status, "bull_stop": orb_low, "bull_target": bull_target,
-            "bull_rr": bull_rr, "bull_trigger_candle": bull_trigger_candle,
-            "bear_status": bear_status, "bear_stop": orb_high, "bear_target": bear_target,
-            "bear_rr": bear_rr, "bear_trigger_candle": bear_trigger_candle,
-        }
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_p2_orb_worker, sym, orb, ist, today, now, all_quotes)
+                   for sym, orb in shortlist.items()]
+        for fut in futures:
+            try:
+                sym, entry = fut.result()
+                results[sym] = entry
+            except Exception as e:
+                log.debug(f"ORB P2 worker error: {e}")
 
     with _orb_lock:
         _orb_results.update(results)
@@ -1433,7 +1458,7 @@ def _bg_run_once():
             import os as _os2, pytz as _pytz2, datetime as _dt2
             _skip_gate = _os2.environ.get("SKIP_MARKET_HOURS_CHECK", "").lower() in ("1", "true", "yes")
             _now_ist = datetime.now(_pytz2.timezone("Asia/Kolkata"))
-            if _skip_gate or _now_ist.time() >= _dt2.time(9, 30):
+            if _skip_gate or _now_ist.time() >= _dt2.time(9, 45):
                 with _orb_lock:
                     _need_p1 = (_orb_date != date_str or not _orb_shortlist)
                 if _need_p1:
