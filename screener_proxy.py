@@ -129,9 +129,12 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
         recs = resp.get("Success") or []
         if not recs:
             global _breeze_diag_logged
-            if not _breeze_diag_logged:
-                _breeze_diag_logged = True
-                log.warning(f"Breeze {breeze_code} {interval}: empty Success list. Raw response keys={list(resp.keys()) if isinstance(resp, dict) else type(resp)}, sample={str(resp)[:500]}")
+            if interval not in _breeze_diag_logged:
+                _breeze_diag_logged.add(interval)
+                log.warning(f"Breeze {breeze_code} {interval}: empty Success list. "
+                            f"from_utc={from_utc} to_utc={to_utc} product_type={product_type} "
+                            f"Raw response keys={list(resp.keys()) if isinstance(resp, dict) else type(resp)}, "
+                            f"sample={str(resp)[:500]}")
             return pd.DataFrame()
         df = pd.DataFrame(recs)
         dt_col = next((c for c in df.columns if c.lower() == "datetime"), None)
@@ -155,7 +158,7 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
 
 
 # Breeze stock codes for indices
-_breeze_diag_logged = False
+_breeze_diag_logged = set()
 _p1_diag_count = 0
 BREEZE_CODE_MAP = {
     "BANKNIFTY":  "CNXBAN",
@@ -1261,6 +1264,7 @@ def _p1_orb_worker(sym, ist, today, now):
             return sym, None, {"symbol": sym, "breeze_code": breeze_code,
                                 "reason": "m5_today_empty_or_short",
                                 "m5_rows": len(m5_today),
+                                "day_start_ist": str(day_start), "now_ist": str(now),
                                 "pdh": round(pdh, 2), "pdl": round(pdl, 2)}
 
         opening  = m5_today.iloc[:3]  # 9:15-9:20, 9:20-9:25, 9:25-9:30 candles
