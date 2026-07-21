@@ -1375,6 +1375,12 @@ def _update_orb_status(all_quotes, date_str):
 
         bull_trigger_candle = None
         bear_trigger_candle = None
+        bull_outcome = None   # "target" | "stop" | None (still running / not triggered)
+        bear_outcome = None
+
+        orb_range   = orb_high - orb_low
+        bull_target = round(orb_high + (atr or 0), 2) if orb["bull_setup"] else None
+        bear_target = round(orb_low  - (atr or 0), 2) if orb["bear_setup"] else None
 
         try:
             df5 = (m5[yf_sym] if (multi and yf_sym in m5_keys) else (m5 if not multi else pd.DataFrame()))
@@ -1398,17 +1404,48 @@ def _update_orb_status(all_quotes, date_str):
                     for candle_num, candle in candles_all:
                         if float(candle["High"]) > orb_high:
                             bull_trigger_candle = candle_num; break
+                    # After entry: check subsequent candles (including the trigger
+                    # candle itself) for whichever comes first — target or stop
+                    # (orb_low). If both conditions appear in the same candle,
+                    # we can't tell which happened first from a 5-min bar alone —
+                    # treat it as stopped out (the conservative/risk-first read).
+                    if bull_trigger_candle is not None and bull_target:
+                        for candle_num, candle in candles_all:
+                            if candle_num < bull_trigger_candle:
+                                continue
+                            hit_stop   = float(candle["Low"])  <= orb_low
+                            hit_target = float(candle["High"]) >= bull_target
+                            if hit_stop:
+                                bull_outcome = "stop"; break
+                            if hit_target:
+                                bull_outcome = "target"; break
+
                 if orb["bear_setup"]:
                     for candle_num, candle in candles_all:
                         if float(candle["Low"]) < orb_low:
                             bear_trigger_candle = candle_num; break
+                    if bear_trigger_candle is not None and bear_target:
+                        for candle_num, candle in candles_all:
+                            if candle_num < bear_trigger_candle:
+                                continue
+                            hit_stop   = float(candle["High"]) >= orb_high
+                            hit_target = float(candle["Low"])  <= bear_target
+                            if hit_stop:
+                                bear_outcome = "stop"; break
+                            if hit_target:
+                                bear_outcome = "target"; break
         except Exception as e:
             log.debug(f"ORB P2 {sym}: {e}")
 
         bull_status = None
         if orb["bull_setup"]:
             if bull_trigger_candle is not None:
-                bull_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+                if bull_outcome == "target":
+                    bull_status = "Target Hit"
+                elif bull_outcome == "stop":
+                    bull_status = "Stopped Out"
+                else:
+                    bull_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
             elif day_low < orb_low:
                 bull_status = "Failed"
             else:
@@ -1417,17 +1454,19 @@ def _update_orb_status(all_quotes, date_str):
         bear_status = None
         if orb["bear_setup"]:
             if bear_trigger_candle is not None:
-                bear_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+                if bear_outcome == "target":
+                    bear_status = "Target Hit"
+                elif bear_outcome == "stop":
+                    bear_status = "Stopped Out"
+                else:
+                    bear_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
             elif day_high > orb_high:
                 bear_status = "Failed"
             else:
                 bear_status = "Watching"
 
-        orb_range   = orb_high - orb_low
-        bull_target = round(orb_high + (atr or 0), 2) if orb["bull_setup"] else None
-        bear_target = round(orb_low  - (atr or 0), 2) if orb["bear_setup"] else None
-        bull_rr     = round((bull_target - orb_high) / orb_range, 2) if (orb["bull_setup"] and orb_range > 0 and bull_target) else None
-        bear_rr     = round((orb_low - bear_target)  / orb_range, 2) if (orb["bear_setup"] and orb_range > 0 and bear_target) else None
+        bull_rr = round((bull_target - orb_high) / orb_range, 2) if (orb["bull_setup"] and orb_range > 0 and bull_target) else None
+        bear_rr = round((orb_low - bear_target)  / orb_range, 2) if (orb["bear_setup"] and orb_range > 0 and bear_target) else None
 
         results[sym] = {
             "symbol": sym, "ltp": ltp, "day_high": day_high, "day_low": day_low,
