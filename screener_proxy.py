@@ -128,6 +128,10 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
         )
         recs = resp.get("Success") or []
         if not recs:
+            global _breeze_diag_logged
+            if not _breeze_diag_logged:
+                _breeze_diag_logged = True
+                log.warning(f"Breeze {breeze_code} {interval}: empty Success list. Raw response keys={list(resp.keys()) if isinstance(resp, dict) else type(resp)}, sample={str(resp)[:500]}")
             return pd.DataFrame()
         df = pd.DataFrame(recs)
         dt_col = next((c for c in df.columns if c.lower() == "datetime"), None)
@@ -146,11 +150,12 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
         }).sort_index()
         return out
     except Exception as e:
-        log.debug(f"Breeze candles fetch {breeze_code} {interval}: {e}")
+        log.warning(f"Breeze candles fetch failed {breeze_code} {interval}: {e}")
         return pd.DataFrame()
 
 
 # Breeze stock codes for indices
+_breeze_diag_logged = False
 BREEZE_CODE_MAP = {
     "BANKNIFTY":  "CNXBAN",
     "NIFTY":      "NIFTY",
