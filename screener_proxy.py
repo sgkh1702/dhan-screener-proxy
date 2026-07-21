@@ -108,7 +108,7 @@ def _get_breeze():
         _init_breeze()
     return _breeze
 
-def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type="cash"):
+def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=""):
     """
     Fetch historical candles from Breeze and return a DataFrame indexed by
     IST datetime with Open/High/Low/Close float columns (sorted ascending).
