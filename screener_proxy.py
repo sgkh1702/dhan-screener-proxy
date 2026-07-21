@@ -1062,6 +1062,7 @@ _orb_shortlist = {}
 _orb_results   = {}
 _orb_date      = ""
 _orb_lock      = threading.Lock()
+_orb_building  = False
 
 
 def _fetch_quotes_batch(symbols):
@@ -1262,7 +1263,7 @@ def _p1_orb_worker(sym, ist, today, now):
 
 
 def _build_orb_shortlist(symbols, date_str):
-    global _orb_shortlist, _orb_date, _orb_results
+    global _orb_shortlist, _orb_date, _orb_results, _orb_building
     import pytz
     ist   = pytz.timezone("Asia/Kolkata")
     now   = datetime.now(ist)
@@ -1271,6 +1272,10 @@ def _build_orb_shortlist(symbols, date_str):
     with _orb_lock:
         if _orb_date == date_str and _orb_shortlist:
             return
+        if _orb_building:
+            log.info("ORB Phase 1: already in progress, skipping this cycle's trigger")
+            return
+        _orb_building = True
 
     mappable = [s for s in symbols if s in NSE_TO_BREEZE]
     skipped  = len(symbols) - len(mappable)
@@ -1281,7 +1286,7 @@ def _build_orb_shortlist(symbols, date_str):
     t0 = time.time()
     try:
         shortlist = {}
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=6) as ex:
             futures = [ex.submit(_p1_orb_worker, sym, ist, today, now) for sym in mappable]
             for fut in futures:
                 res = fut.result()
@@ -1299,6 +1304,9 @@ def _build_orb_shortlist(symbols, date_str):
         log.info(f"ORB Phase 1 done in {round(time.time()-t0)}s — {len(shortlist)} setups ({bull_n} bull, {bear_n} bear)")
     except Exception as e:
         log.error(f"_build_orb_shortlist: {e}")
+    finally:
+        with _orb_lock:
+            _orb_building = False
 
 
 def _p2_orb_worker(sym, orb, ist, today, now, all_quotes):
