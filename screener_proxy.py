@@ -156,6 +156,7 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
 
 # Breeze stock codes for indices
 _breeze_diag_logged = False
+_p1_diag_count = 0
 BREEZE_CODE_MAP = {
     "BANKNIFTY":  "CNXBAN",
     "NIFTY":      "NIFTY",
@@ -1207,9 +1208,17 @@ def _p1_orb_worker(sym, ist, today, now):
         daily_df = _breeze_candles(breeze_code, "1day", now - timedelta(days=35), now)
         if daily_df.empty or len(daily_df) < 2:
             return None
-        pdh        = float(daily_df["High"].iloc[-2])
-        pdl        = float(daily_df["Low"].iloc[-2])
-        prev_close = float(daily_df["Close"].iloc[-2])
+
+        # Breeze's daily candles only include COMPLETED days (no live partial
+        # candle for today), unlike the old yfinance pull. So "previous day"
+        # is iloc[-1] here, not iloc[-2] — but check the actual date instead
+        # of assuming, in case that ever changes.
+        last_row_is_today = daily_df.index[-1].date() == today
+        prev_idx = -2 if last_row_is_today else -1
+
+        pdh        = float(daily_df["High"].iloc[prev_idx])
+        pdl        = float(daily_df["Low"].iloc[prev_idx])
+        prev_close = float(daily_df["Close"].iloc[prev_idx])
 
         hi, lo, cl = daily_df["High"], daily_df["Low"], daily_df["Close"]
         tr = pd.concat([hi - lo, (hi - cl.shift(1)).abs(), (lo - cl.shift(1)).abs()],
@@ -1229,6 +1238,15 @@ def _p1_orb_worker(sym, ist, today, now):
 
         bull_setup = orb_high > pdh
         bear_setup = orb_low  < pdl
+
+        global _p1_diag_count
+        if _p1_diag_count < 5:
+            _p1_diag_count += 1
+            log.warning(f"ORB P1 diag [{sym}]: last_daily_row={daily_df.index[-1].date()} "
+                        f"today={today} used_prev_idx={prev_idx} "
+                        f"orb_high={orb_high} orb_low={orb_low} pdh={pdh} pdl={pdl} "
+                        f"bull={bull_setup} bear={bear_setup}")
+
         if not bull_setup and not bear_setup:
             return None
 
