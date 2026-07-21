@@ -994,6 +994,53 @@ def last_snapshot():
         return ok({"rows": [], "error": str(e)})
 
 
+@app.route("/orb_raw")
+def orb_raw():
+    import pytz
+    sym = request.args.get("symbol", "").upper().strip()
+    if not sym:
+        return ok({"error": "Pass ?symbol=SYMBOL"}, 400)
+
+    ist   = pytz.timezone("Asia/Kolkata")
+    now   = datetime.now(ist)
+    today = now.date()
+    yf_sym = to_yf(sym)
+
+    try:
+        df5 = yf.download(yf_sym, period="2d", interval="5m",
+                          auto_adjust=True, progress=False, threads=False)
+        if df5.empty:
+            return ok({"error": f"No 5m data returned for {sym} ({yf_sym})"}, 404)
+        if isinstance(df5.columns, pd.MultiIndex):
+            df5.columns = df5.columns.get_level_values(0)
+        df5.index = pd.to_datetime(df5.index)
+        idx_ist = ([ts.astimezone(ist) for ts in df5.index] if df5.index.tzinfo is not None
+                    else [ist.localize(ts) for ts in df5.index])
+        today_rows = df5[[d.date() == today for d in idx_ist]]
+        today_idx  = [d for d in idx_ist if d.date() == today]
+
+        rows = []
+        for ts, (_, row) in zip(today_idx, today_rows.iterrows()):
+            rows.append({
+                "timestamp_ist": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": round(float(row["Open"]), 2), "high": round(float(row["High"]), 2),
+                "low": round(float(row["Low"]), 2), "close": round(float(row["Close"]), 2),
+            })
+
+        opening = rows[:3]
+        orb_high = max((r["high"] for r in opening), default=None)
+        orb_low  = min((r["low"]  for r in opening), default=None)
+
+        return ok({
+            "symbol": sym, "yf_symbol": yf_sym, "today": str(today),
+            "computed_orb_high": orb_high, "computed_orb_low": orb_low,
+            "opening_range_candles_used": opening,
+            "all_today_candles": rows,
+        })
+    except Exception as e:
+        return ok({"error": f"orb_raw {sym}: {e}"}, 500)
+
+
 @app.route("/orb_debug")
 def orb_debug():
     with _orb_lock:
@@ -1375,12 +1422,17 @@ def _update_orb_status(all_quotes, date_str):
 
         bull_trigger_candle = None
         bear_trigger_candle = None
+        bull_breakout_any_candle = None
+        bear_breakout_any_candle = None
         bull_outcome = None   # "target" | "stop" | None (still running / not triggered)
         bear_outcome = None
+        latest_candle_num = 0
 
         orb_range   = orb_high - orb_low
         bull_target = round(orb_high + (atr or 0), 2) if orb["bull_setup"] else None
         bear_target = round(orb_low  - (atr or 0), 2) if orb["bear_setup"] else None
+
+        ENTRY_WINDOW_CANDLES = 12  # up to 1 hour post-opening-range (9:30-10:30) counts as a valid entry
 
         try:
             df5 = (m5[yf_sym] if (multi and yf_sym in m5_keys) else (m5 if not multi else pd.DataFrame()))
@@ -1390,25 +1442,33 @@ def _update_orb_status(all_quotes, date_str):
                 idx_ist = ([ts.astimezone(ist) for ts in df5.index] if df5.index.tzinfo is not None
                             else [ist.localize(ts) for ts in df5.index])
 
-                # Opening range is the first 15 min (9:15-9:30). Breakout checking
-                # starts on the first candle after that and continues every 5 min
-                # for the rest of the session — no fixed cutoff window.
+                # Opening range is the first 15 min (9:15-9:30). A breakout must
+                # occur within the first hour after that (C1-C12) to count as a
+                # valid entry — later breakouts are just price drifting past an
+                # old fixed line, not a real ORB momentum trade.
                 c1_start = _dt.time(9, 30)
                 candles_all = [
                     (idx+1, df5.iloc[i])
                     for i, (ts, idx) in enumerate(zip(idx_ist, range(len(idx_ist))))
                     if ts.date() == today and ts.time() >= c1_start
                 ]
+                candles_window = [c for c in candles_all if c[0] <= ENTRY_WINDOW_CANDLES]
+                latest_candle_num = candles_all[-1][0] if candles_all else 0
 
                 if orb["bull_setup"]:
-                    for candle_num, candle in candles_all:
+                    for candle_num, candle in candles_window:
                         if float(candle["High"]) > orb_high:
                             bull_trigger_candle = candle_num; break
-                    # After entry: check subsequent candles (including the trigger
-                    # candle itself) for whichever comes first — target or stop
-                    # (orb_low). If both conditions appear in the same candle,
-                    # we can't tell which happened first from a 5-min bar alone —
-                    # treat it as stopped out (the conservative/risk-first read).
+                    if bull_trigger_candle is None:
+                        for candle_num, candle in candles_all:
+                            if float(candle["High"]) > orb_high:
+                                bull_breakout_any_candle = candle_num; break
+                    # After a VALID entry: check subsequent candles (including the
+                    # trigger candle itself), unrestricted by the entry window, for
+                    # whichever comes first — target or stop (orb_low). If both
+                    # conditions appear in the same candle, we can't tell which
+                    # happened first from a 5-min bar alone — treat it as stopped
+                    # out (the conservative/risk-first read).
                     if bull_trigger_candle is not None and bull_target:
                         for candle_num, candle in candles_all:
                             if candle_num < bull_trigger_candle:
@@ -1421,9 +1481,13 @@ def _update_orb_status(all_quotes, date_str):
                                 bull_outcome = "target"; break
 
                 if orb["bear_setup"]:
-                    for candle_num, candle in candles_all:
+                    for candle_num, candle in candles_window:
                         if float(candle["Low"]) < orb_low:
                             bear_trigger_candle = candle_num; break
+                    if bear_trigger_candle is None:
+                        for candle_num, candle in candles_all:
+                            if float(candle["Low"]) < orb_low:
+                                bear_breakout_any_candle = candle_num; break
                     if bear_trigger_candle is not None and bear_target:
                         for candle_num, candle in candles_all:
                             if candle_num < bear_trigger_candle:
@@ -1437,6 +1501,8 @@ def _update_orb_status(all_quotes, date_str):
         except Exception as e:
             log.debug(f"ORB P2 {sym}: {e}")
 
+        window_closed = latest_candle_num > ENTRY_WINDOW_CANDLES
+
         bull_status = None
         if orb["bull_setup"]:
             if bull_trigger_candle is not None:
@@ -1446,8 +1512,12 @@ def _update_orb_status(all_quotes, date_str):
                     bull_status = "Stopped Out"
                 else:
                     bull_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+            elif bull_breakout_any_candle is not None:
+                bull_status = "Missed"  # broke out, but after the 1-hour entry window
             elif day_low < orb_low:
                 bull_status = "Failed"
+            elif window_closed:
+                bull_status = "Missed"  # window closed, never broke out
             else:
                 bull_status = "Watching"
 
@@ -1460,8 +1530,12 @@ def _update_orb_status(all_quotes, date_str):
                     bear_status = "Stopped Out"
                 else:
                     bear_status = "Triggered" if (atr_consumed is None or atr_consumed <= 80) else "Missed"
+            elif bear_breakout_any_candle is not None:
+                bear_status = "Missed"  # broke out, but after the 1-hour entry window
             elif day_high > orb_high:
                 bear_status = "Failed"
+            elif window_closed:
+                bear_status = "Missed"  # window closed, never broke out
             else:
                 bear_status = "Watching"
 
