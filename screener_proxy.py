@@ -991,6 +991,30 @@ def last_snapshot():
         return ok({"rows": [], "error": str(e)})
 
 
+@app.route("/orb_debug")
+def orb_debug():
+    with _orb_lock:
+        diag = list(_orb_diag)
+        orb_date = _orb_date
+        building = _orb_building
+        shortlist_n = len(_orb_shortlist)
+
+    reasons = {}
+    for d in diag:
+        reasons[d.get("reason", "?")] = reasons.get(d.get("reason", "?"), 0) + 1
+
+    return ok({
+        "orb_date": orb_date,
+        "building_now": building,
+        "shortlist_count": shortlist_n,
+        "diag_symbol_count": len(diag),
+        "reason_counts": reasons,
+        "sample_ok":      [d for d in diag if d.get("reason") == "ok"][:10],
+        "sample_no_setup":[d for d in diag if d.get("reason") == "no_setup_qualified"][:10],
+        "sample_other":   [d for d in diag if d.get("reason") not in ("ok","no_setup_qualified")][:15],
+    })
+
+
 @app.route("/orb")
 def orb():
     try:
@@ -1063,6 +1087,7 @@ _orb_results   = {}
 _orb_date      = ""
 _orb_lock      = threading.Lock()
 _orb_building  = False
+_orb_diag      = []   # last Phase 1 run's per-symbol diagnostic snapshot
 
 
 def _fetch_quotes_batch(symbols):
@@ -1200,15 +1225,19 @@ def _p1_orb_worker(sym, ist, today, now):
     if the symbol isn't mappable / doesn't qualify as a setup.
     Opening range = first 3 five-min candles of the day (9:15-9:30), which
     is the true opening 15 minutes — Breeze has no native 15-min interval.
+    Always returns (sym, entry_or_None, diag_dict) so every symbol's outcome
+    (success or the specific reason it was skipped) is inspectable.
     """
     import datetime as _dt
     breeze_code = NSE_TO_BREEZE.get(sym)
     if not breeze_code:
-        return None
+        return sym, None, {"symbol": sym, "reason": "no_breeze_code"}
     try:
         daily_df = _breeze_candles(breeze_code, "1day", now - timedelta(days=35), now)
         if daily_df.empty or len(daily_df) < 2:
-            return None
+            return sym, None, {"symbol": sym, "breeze_code": breeze_code,
+                                "reason": "daily_df_empty_or_short",
+                                "daily_rows": len(daily_df)}
 
         # Breeze's daily candles only include COMPLETED days (no live partial
         # candle for today), unlike the old yfinance pull. So "previous day"
@@ -1229,7 +1258,10 @@ def _p1_orb_worker(sym, ist, today, now):
         day_start = ist.localize(_dt.datetime.combine(today, _dt.time(9, 15)))
         m5_today  = _breeze_candles(breeze_code, "5minute", day_start, now)
         if m5_today.empty or len(m5_today) < 3:
-            return None  # opening range not fully formed yet
+            return sym, None, {"symbol": sym, "breeze_code": breeze_code,
+                                "reason": "m5_today_empty_or_short",
+                                "m5_rows": len(m5_today),
+                                "pdh": round(pdh, 2), "pdl": round(pdl, 2)}
 
         opening  = m5_today.iloc[:3]  # 9:15-9:20, 9:20-9:25, 9:25-9:30 candles
         orb_high = round(float(opening["High"].max()), 2)
@@ -1240,30 +1272,31 @@ def _p1_orb_worker(sym, ist, today, now):
         bull_setup = orb_high > pdh
         bear_setup = orb_low  < pdl
 
-        global _p1_diag_count
-        if _p1_diag_count < 5:
-            _p1_diag_count += 1
-            log.warning(f"ORB P1 diag [{sym}]: last_daily_row={daily_df.index[-1].date()} "
-                        f"today={today} used_prev_idx={prev_idx} "
-                        f"orb_high={orb_high} orb_low={orb_low} pdh={pdh} pdl={pdl} "
-                        f"bull={bull_setup} bear={bear_setup}")
+        diag = {
+            "symbol": sym, "breeze_code": breeze_code,
+            "last_daily_row": str(daily_df.index[-1].date()), "today": str(today),
+            "prev_idx": prev_idx, "m5_rows": len(m5_today),
+            "orb_high": orb_high, "orb_low": orb_low,
+            "pdh": round(pdh, 2), "pdl": round(pdl, 2),
+            "bull_setup": bull_setup, "bear_setup": bear_setup,
+            "reason": "ok" if (bull_setup or bear_setup) else "no_setup_qualified",
+        }
 
         if not bull_setup and not bear_setup:
-            return None
+            return sym, None, diag
 
         return sym, {
             "orb_high": orb_high, "orb_low": orb_low, "orb_open": orb_open,
             "pdh": round(pdh, 2), "pdl": round(pdl, 2), "prev_close": round(prev_close, 2),
             "atr": atr, "gap_pct": gap_pct,
             "bull_setup": bull_setup, "bear_setup": bear_setup,
-        }
+        }, diag
     except Exception as e:
-        log.debug(f"ORB P1 {sym}: {e}")
-        return None
+        return sym, None, {"symbol": sym, "reason": "exception", "error": str(e)}
 
 
 def _build_orb_shortlist(symbols, date_str):
-    global _orb_shortlist, _orb_date, _orb_results, _orb_building
+    global _orb_shortlist, _orb_date, _orb_results, _orb_building, _orb_diag
     import pytz
     ist   = pytz.timezone("Asia/Kolkata")
     now   = datetime.now(ist)
@@ -1286,22 +1319,27 @@ def _build_orb_shortlist(symbols, date_str):
     t0 = time.time()
     try:
         shortlist = {}
+        diag_list = []
         with ThreadPoolExecutor(max_workers=6) as ex:
             futures = [ex.submit(_p1_orb_worker, sym, ist, today, now) for sym in mappable]
             for fut in futures:
-                res = fut.result()
-                if res:
-                    sym, entry = res
+                sym, entry, diag = fut.result()
+                diag_list.append(diag)
+                if entry:
                     shortlist[sym] = entry
 
         with _orb_lock:
             _orb_shortlist = shortlist
             _orb_date      = date_str
             _orb_results   = {}
+            _orb_diag      = diag_list
 
         bull_n = sum(1 for v in shortlist.values() if v["bull_setup"])
         bear_n = sum(1 for v in shortlist.values() if v["bear_setup"])
-        log.info(f"ORB Phase 1 done in {round(time.time()-t0)}s — {len(shortlist)} setups ({bull_n} bull, {bear_n} bear)")
+        reasons = {}
+        for d in diag_list:
+            reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
+        log.info(f"ORB Phase 1 done in {round(time.time()-t0)}s — {len(shortlist)} setups ({bull_n} bull, {bear_n} bear) — reasons: {reasons}")
     except Exception as e:
         log.error(f"_build_orb_shortlist: {e}")
     finally:
