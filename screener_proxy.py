@@ -233,6 +233,7 @@ def _fetch_breeze_oc(symbol: str, expiry: str):
                     "oi":         oi,
                     "oi_chg":     oichg,
                     "iv":         0,
+                    "volume":     int(float(rec.get("total_quantity_traded", 0) or 0)),
                 }
             time.sleep(1)
         except Exception as e:
@@ -270,6 +271,8 @@ def _fetch_breeze_oc(symbol: str, expiry: str):
             "pe_oi_chg":  pe_oichg,
             "ce_iv":      ce.get("iv", 0),
             "pe_iv":      pe.get("iv", 0),
+            "ce_volume":  ce.get("volume", 0),
+            "pe_volume":  pe.get("volume", 0),
             "pcr":        pcr,
             "signal":     _signal(ce_oichg, ce_ltpchg),
             "pe_signal":  _signal(pe_oichg, pe_ltpchg),
