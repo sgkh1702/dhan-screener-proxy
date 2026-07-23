@@ -158,13 +158,16 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
         # One-time diagnostic: log the raw record shape for this (code, exchange)
         # combo so we can see exactly what Breeze sends back — this is here
         # specifically to root-cause vol_declining showing null on futures.
+        # Logs the LATEST candle (freshness), not the oldest — that's the
+        # actual question: is Breeze giving us today's still-forming bars?
         global _breeze_vol_diag_logged
         diag_key = f"{breeze_code}:{exchange_code}"
         if diag_key not in _breeze_vol_diag_logged:
             _breeze_vol_diag_logged.add(diag_key)
             log.warning(f"Breeze candle diag [{diag_key}]: columns={list(df.columns)}, "
-                        f"has_volume_key={'volume' in cols}, "
-                        f"sample_record={recs[0] if recs else None}")
+                        f"has_volume_key={'volume' in cols}, n_records={len(recs)}, "
+                        f"earliest_ist={df.index.min()}, latest_ist={df.index.max()}, "
+                        f"latest_record={recs[-1]}")
 
         out = pd.DataFrame({
             "Open":   df[cols["open"]].astype(float),
