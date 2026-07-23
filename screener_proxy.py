@@ -2350,7 +2350,9 @@ def futures_signal():
         return ok({"error": f"Unsupported symbol: {symbol}"}, 400)
     try:
         result = _futures_signal(symbol)
-        return ok(result, 200 if "error" not in result else 500)
+        resp = ok(result, 200 if "error" not in result else 500)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return resp
     except Exception as e:
         log.error(f"/futures-signal error: {e}")
         return ok({"error": str(e)}, 500)
