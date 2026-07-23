@@ -18,6 +18,7 @@ Endpoints:
   GET  /option-chain    -> live option chain via Breeze API
   GET  /option_ltp      -> CE/PE LTP for specific strikes via Breeze API
   GET  /stock-ranks     -> Momentum + Retracement ranking from DailyShortlist tab
+  GET  /futures-signal  -> EMA20/50 + VWAP + volume trend light for Nifty/BankNifty futures
 
 Run:
     pip install flask yfinance flask-cors pandas gspread google-auth pytz
@@ -108,11 +109,16 @@ def _get_breeze():
         _init_breeze()
     return _breeze
 
-def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=""):
+def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type="",
+                     exchange_code="NSE", expiry_date=None):
     """
     Fetch historical candles from Breeze and return a DataFrame indexed by
-    IST datetime with Open/High/Low/Close float columns (sorted ascending).
+    IST datetime with Open/High/Low/Close/Volume float columns (sorted ascending).
     interval: "1minute", "5minute", "30minute", or "1day".
+    exchange_code: "NSE" for cash/index spot (default, unchanged from before).
+                   "NFO" for futures/options — requires expiry_date.
+    expiry_date: ISO string like "2026-07-30T06:00:00.000Z". Required when
+                 exchange_code="NFO"; ignored otherwise.
     Returns an empty DataFrame on any failure (missing session, no data, etc).
     """
     import pytz as _pytz_bc
@@ -122,17 +128,20 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
     try:
         from_utc = from_dt_ist.astimezone(_pytz_bc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         to_utc   = to_dt_ist.astimezone(_pytz_bc.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        resp = breeze.get_historical_data_v2(
+        kwargs = dict(
             interval=interval, from_date=from_utc, to_date=to_utc,
-            stock_code=breeze_code, exchange_code="NSE", product_type=product_type,
+            stock_code=breeze_code, exchange_code=exchange_code, product_type=product_type,
         )
+        if expiry_date:
+            kwargs["expiry_date"] = expiry_date
+        resp = breeze.get_historical_data_v2(**kwargs)
         recs = resp.get("Success") or []
         if not recs:
             global _breeze_diag_logged
             if interval not in _breeze_diag_logged:
                 _breeze_diag_logged.add(interval)
                 log.warning(f"Breeze {breeze_code} {interval}: empty Success list. "
-                            f"from_utc={from_utc} to_utc={to_utc} product_type={product_type} "
+                            f"from_utc={from_utc} to_utc={to_utc} product_type={product_type} exchange_code={exchange_code} "
                             f"Raw response keys={list(resp.keys()) if isinstance(resp, dict) else type(resp)}, "
                             f"sample={str(resp)[:500]}")
             return pd.DataFrame()
@@ -146,10 +155,11 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
         df.index = ts.dt.tz_convert(_pytz_bc.timezone("Asia/Kolkata"))
         cols = {c.lower(): c for c in df.columns}
         out = pd.DataFrame({
-            "Open":  df[cols["open"]].astype(float),
-            "High":  df[cols["high"]].astype(float),
-            "Low":   df[cols["low"]].astype(float),
-            "Close": df[cols["close"]].astype(float),
+            "Open":   df[cols["open"]].astype(float),
+            "High":   df[cols["high"]].astype(float),
+            "Low":    df[cols["low"]].astype(float),
+            "Close":  df[cols["close"]].astype(float),
+            "Volume": df[cols["volume"]].astype(float) if "volume" in cols else 0.0,
         }).sort_index()
         return out
     except Exception as e:
@@ -283,6 +293,102 @@ def _fetch_breeze_oc(symbol: str, expiry: str):
     return chain, spot
 
 
+# ── FUTURES SIGNAL (Module 3 — trend/VWAP/volume scorecard) ──────────────────
+# Nifty/BankNifty futures only (spot indices have no real volume, and stocks
+# are excluded from the strategy per the spec). Uses the shared monthly
+# expiry in Token!B14 — all NSE F&O expiries (index + stock) have used a
+# single last-Tuesday-of-month cycle since Sep 2025, so one cell now covers
+# both Nifty and BankNifty futures.
+_futures_signal_cache = {}
+_futures_signal_cache_ttl = 60  # seconds — signal is 5-min-bar based, no need to hit Breeze every poll
+
+def _futures_signal(symbol: str):
+    symbol = symbol.upper()
+    cached = _futures_signal_cache.get(symbol)
+    if cached and (time.time() - cached["ts"]) < _futures_signal_cache_ttl:
+        return cached["data"]
+
+    breeze_code = BREEZE_CODE_MAP.get(symbol)
+    if not breeze_code:
+        return {"error": f"Unsupported symbol: {symbol}"}
+    if _sh is None:
+        return {"error": "Sheets not connected"}
+
+    try:
+        raw = _sh.worksheet("Token").acell("B14").value
+        expiry = raw.strip() if raw else ""
+    except Exception as e:
+        return {"error": f"Could not read expiry: {e}"}
+    if not expiry:
+        return {"error": "No monthly expiry found in Token!B14"}
+    expiry_iso = f"{expiry}T06:00:00.000Z"
+
+    import pytz as _pytz_fs
+    ist = _pytz_fs.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    # Look back several calendar days (not just today) so EMA50 has enough
+    # 5-min bars to warm up even early in today's session — 50 bars = ~4.2hrs,
+    # more than the whole primary signal window (9:45-10:30) would provide
+    # on its own.
+    from_dt = (now - timedelta(days=5)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    df = _breeze_candles(breeze_code, "5minute", from_dt, now,
+                          product_type="futures", exchange_code="NFO", expiry_date=expiry_iso)
+    if df.empty:
+        return {"error": "No futures candle data returned from Breeze"}
+
+    ema20 = _compute_ema(df["Close"], 20)
+    ema50 = _compute_ema(df["Close"], 50)
+    ltp   = float(df["Close"].iloc[-1])
+
+    today_df = df[df.index.date == now.date()]
+    vwap = _compute_vwap(today_df if not today_df.empty else df)
+
+    trend = None
+    if ema20 is not None and ema50 is not None:
+        trend = "bullish" if ema20 > ema50 else "bearish" if ema20 < ema50 else "flat"
+
+    price_vs_vwap = None
+    if vwap is not None:
+        price_vs_vwap = "above" if ltp > vwap else "below" if ltp < vwap else "at"
+
+    # Volume trend within today's session: last 3 bars' avg vs the 3 before
+    # that. Declining volume near a level is the spec's "holding" confirmation.
+    vol_declining = None
+    if len(today_df) >= 6 and today_df["Volume"].sum() > 0:
+        recent = today_df["Volume"].iloc[-3:].mean()
+        prior  = today_df["Volume"].iloc[-6:-3].mean()
+        vol_declining = bool(recent < prior)
+
+    # Light = trend + VWAP agreement. Volume is surfaced separately rather than
+    # gating the light — early-session bars are often too sparse for a reliable
+    # 3-vs-3 volume read, and the OI-wall proximity check (level) already lives
+    # in the frontend's existing highlighting, not here.
+    if trend == "bullish" and price_vs_vwap == "above":
+        light = "green"
+    elif trend == "bearish" and price_vs_vwap == "below":
+        light = "red"
+    else:
+        light = "amber"
+
+    result = {
+        "symbol": symbol,
+        "expiry": expiry,
+        "ltp": round(ltp, 2),
+        "ema20": ema20,
+        "ema50": ema50,
+        "vwap": vwap,
+        "trend": trend,
+        "price_vs_vwap": price_vs_vwap,
+        "vol_declining": vol_declining,
+        "light": light,
+        "bars_used": len(df),
+        "time": now.isoformat(),
+    }
+    _futures_signal_cache[symbol] = {"data": result, "ts": time.time()}
+    return result
+
+
 # ── fno.csv reader ─────────────────────────────────────────────────────────────
 def read_fno_csv() -> list:
     if not os.path.exists(FNO_CSV):
@@ -375,6 +481,23 @@ def _compute_ema(series, period=20):
     ema = series.ewm(span=period, adjust=False).mean()
     val = ema.iloc[-1]
     return round(float(val), 2) if not math.isnan(val) else None
+
+# ── Session VWAP ──────────────────────────────────────────────────────────────
+def _compute_vwap(df):
+    """
+    Cumulative (typical price * volume) / cumulative volume.
+    Caller must pre-filter df to a single session's candles — VWAP resets daily,
+    it isn't meant to run across multiple days like EMA does.
+    Returns the latest VWAP value, or None if there's no usable volume data.
+    """
+    if df is None or df.empty or "Volume" not in df.columns or df["Volume"].sum() == 0:
+        return None
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    cum_vol = df["Volume"].cumsum()
+    cum_pv  = (typical * df["Volume"]).cumsum()
+    vwap    = cum_pv / cum_vol.replace(0, float("nan"))
+    val     = vwap.iloc[-1]
+    return round(float(val), 2) if pd.notna(val) else None
 
 # ── ADX scalar ────────────────────────────────────────────────────────────────
 def _compute_adx(high, low, close, period=14):
@@ -2203,6 +2326,23 @@ def option_chain_live():
 
 
 # ── OPTION LTP (live via Breeze) ──────────────────────────────────────────────
+# ── FUTURES SIGNAL ─────────────────────────────────────────────────────────
+# GET /futures-signal?symbol=NIFTY (or BANKNIFTY)
+# Returns EMA20/50 + VWAP + volume-trend based trend light for that index's
+# current-month futures contract. Nifty/BankNifty only.
+@app.route("/futures-signal")
+def futures_signal():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    if symbol not in ("NIFTY", "BANKNIFTY"):
+        return ok({"error": f"Unsupported symbol: {symbol}"}, 400)
+    try:
+        result = _futures_signal(symbol)
+        return ok(result, 200 if "error" not in result else 500)
+    except Exception as e:
+        log.error(f"/futures-signal error: {e}")
+        return ok({"error": str(e)}, 500)
+
+
 # GET /option_ltp?symbol=BANKNIFTY&expiry=2026-06-30&strikes=54500,54600
 # Used by StrategyBuilder journal for live P&L
 @app.route("/option_ltp")
