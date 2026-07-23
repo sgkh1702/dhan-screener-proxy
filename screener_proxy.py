@@ -155,20 +155,6 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
         df.index = ts.dt.tz_convert(_pytz_bc.timezone("Asia/Kolkata"))
         cols = {c.lower(): c for c in df.columns}
 
-        # One-time diagnostic: log the raw record shape for this (code, exchange)
-        # combo so we can see exactly what Breeze sends back — this is here
-        # specifically to root-cause vol_declining showing null on futures.
-        # Logs the LATEST candle (freshness), not the oldest — that's the
-        # actual question: is Breeze giving us today's still-forming bars?
-        global _breeze_vol_diag_logged
-        diag_key = f"{breeze_code}:{exchange_code}"
-        if diag_key not in _breeze_vol_diag_logged:
-            _breeze_vol_diag_logged.add(diag_key)
-            log.warning(f"Breeze candle diag [{diag_key}]: columns={list(df.columns)}, "
-                        f"has_volume_key={'volume' in cols}, n_records={len(recs)}, "
-                        f"earliest_ist={df.index.min()}, latest_ist={df.index.max()}, "
-                        f"latest_record={recs[-1]}")
-
         out = pd.DataFrame({
             "Open":   df[cols["open"]].astype(float),
             "High":   df[cols["high"]].astype(float),
@@ -176,6 +162,18 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
             "Close":  df[cols["close"]].astype(float),
             "Volume": df[cols["volume"]].astype(float) if "volume" in cols else 0.0,
         }).sort_index()
+
+        # One-time diagnostic: log the tail of the SORTED frame — this is what
+        # iloc[-1] in the signal calc actually reads. recs[-1] (raw array order)
+        # was unreliable since Breeze doesn't guarantee chronological ordering.
+        global _breeze_vol_diag_logged
+        diag_key = f"{breeze_code}:{exchange_code}"
+        if diag_key not in _breeze_vol_diag_logged:
+            _breeze_vol_diag_logged.add(diag_key)
+            log.warning(f"Breeze candle diag [{diag_key}]: n_records={len(recs)}, "
+                        f"n_unique_ts={df.index.nunique()}, "
+                        f"tail5=\n{out.tail(5).to_string()}")
+
         return out
     except Exception as e:
         log.warning(f"Breeze candles fetch failed {breeze_code} {interval}: {e}")
