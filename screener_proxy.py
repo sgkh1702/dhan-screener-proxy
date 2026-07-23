@@ -154,6 +154,18 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
             ts = ts.dt.tz_localize("UTC")
         df.index = ts.dt.tz_convert(_pytz_bc.timezone("Asia/Kolkata"))
         cols = {c.lower(): c for c in df.columns}
+
+        # One-time diagnostic: log the raw record shape for this (code, exchange)
+        # combo so we can see exactly what Breeze sends back — this is here
+        # specifically to root-cause vol_declining showing null on futures.
+        global _breeze_vol_diag_logged
+        diag_key = f"{breeze_code}:{exchange_code}"
+        if diag_key not in _breeze_vol_diag_logged:
+            _breeze_vol_diag_logged.add(diag_key)
+            log.warning(f"Breeze candle diag [{diag_key}]: columns={list(df.columns)}, "
+                        f"has_volume_key={'volume' in cols}, "
+                        f"sample_record={recs[0] if recs else None}")
+
         out = pd.DataFrame({
             "Open":   df[cols["open"]].astype(float),
             "High":   df[cols["high"]].astype(float),
@@ -169,6 +181,7 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
 
 # Breeze stock codes for indices
 _breeze_diag_logged = set()
+_breeze_vol_diag_logged = set()
 _p1_diag_count = 0
 BREEZE_CODE_MAP = {
     "BANKNIFTY":  "CNXBAN",
