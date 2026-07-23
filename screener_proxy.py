@@ -183,6 +183,7 @@ def _breeze_candles(breeze_code, interval, from_dt_ist, to_dt_ist, product_type=
 # Breeze stock codes for indices
 _breeze_diag_logged = set()
 _breeze_vol_diag_logged = set()
+_vol_today_diag_logged = set()
 _p1_diag_count = 0
 BREEZE_CODE_MAP = {
     "BANKNIFTY":  "CNXBAN",
@@ -353,10 +354,40 @@ def _futures_signal(symbol: str):
 
     ema20 = _compute_ema(df["Close"], 20)
     ema50 = _compute_ema(df["Close"], 50)
-    ltp   = float(df["Close"].iloc[-1])
+
+    # get_historical_data_v2's latest candle can lag real price by a lot for
+    # the still-forming session bar — confirmed live (persistent ~100pt gap
+    # vs actual market price). Use a real live quote for ltp instead; only
+    # fall back to the historical close if the live quote call fails.
+    ltp = None
+    ltp_source = "historical_fallback"
+    try:
+        breeze = _get_breeze()
+        qresp = breeze.get_quotes(stock_code=breeze_code, exchange_code="NFO",
+                                   expiry_date=expiry_iso, product_type="futures",
+                                   right="others", strike_price="0")
+        qrecs = qresp.get("Success") or []
+        if qrecs:
+            v = float(qrecs[0].get("ltp", 0) or 0)
+            if v:
+                ltp = v
+                ltp_source = "live_quote"
+    except Exception as e:
+        log.warning(f"Live futures quote failed for {symbol}: {e}")
+    if ltp is None:
+        ltp = float(df["Close"].iloc[-1])  # fallback — may lag, see above
 
     today_df = df[df.index.date == now.date()]
     vwap = _compute_vwap(today_df if not today_df.empty else df)
+
+    # One-time diagnostic: is today's volume genuinely all-zero (Breeze not
+    # backfilling volume for the still-forming session), or something else?
+    global _vol_today_diag_logged
+    if symbol not in _vol_today_diag_logged:
+        _vol_today_diag_logged.add(symbol)
+        log.warning(f"Today-volume diag [{symbol}]: n_today={len(today_df)}, "
+                    f"today_vol_sum={today_df['Volume'].sum() if not today_df.empty else 'n/a'}, "
+                    f"today_vol_tail=\n{today_df[['Close','Volume']].tail(8).to_string() if not today_df.empty else 'empty'}")
 
     trend = None
     if ema20 is not None and ema50 is not None:
@@ -389,6 +420,7 @@ def _futures_signal(symbol: str):
         "symbol": symbol,
         "expiry": expiry,
         "ltp": round(ltp, 2),
+        "ltp_source": ltp_source,
         "ema20": ema20,
         "ema50": ema50,
         "vwap": vwap,
