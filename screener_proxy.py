@@ -2391,6 +2391,67 @@ def futures_signal():
         return ok({"error": str(e)}, 500)
 
 
+_daily_ema_cache = {}
+_daily_ema_cache_ttl = 3600  # 1 hour — daily EMAs only need to update once a day
+
+def _daily_ema(symbol: str):
+    symbol = symbol.upper()
+    cached = _daily_ema_cache.get(symbol)
+    if cached and (time.time() - cached["ts"]) < _daily_ema_cache_ttl:
+        return cached["data"]
+
+    breeze_code = BREEZE_CODE_MAP.get(symbol)
+    if not breeze_code:
+        return {"error": f"Unsupported symbol: {symbol}"}
+
+    import pytz as _pytz_de
+    ist = _pytz_de.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    # 200-day EMA needs 200 daily bars to warm up; pad well past a year to
+    # comfortably absorb weekends/holidays.
+    from_dt = (now - timedelta(days=400)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Default product_type/exchange_code -> NSE cash/index spot, continuous
+    # history (no futures expiry rollover issue for a 200-day lookback).
+    df = _breeze_candles(breeze_code, "1day", from_dt, now)
+    if df.empty:
+        return {"error": "No daily candle data returned from Breeze"}
+
+    ema20  = _compute_ema(df["Close"], 20)
+    ema50  = _compute_ema(df["Close"], 50)
+    ema200 = _compute_ema(df["Close"], 200)
+    ltp    = float(df["Close"].iloc[-1])
+
+    result = {
+        "symbol": symbol,
+        "ltp": round(ltp, 2),
+        "ema20": ema20,
+        "ema50": ema50,
+        "ema200": ema200,
+        "bars_used": len(df),
+        "time": now.isoformat(),
+    }
+    _daily_ema_cache[symbol] = {"data": result, "ts": time.time()}
+    return result
+
+
+# Daily-candle EMA20/50/200 for Nifty/BankNifty spot — support/resistance
+# context, separate from the 5-min intraday trend light in /futures-signal.
+@app.route("/daily-ema")
+def daily_ema():
+    symbol = request.args.get("symbol", "NIFTY").upper()
+    if symbol not in ("NIFTY", "BANKNIFTY"):
+        return ok({"error": f"Unsupported symbol: {symbol}"}, 400)
+    try:
+        result = _daily_ema(symbol)
+        resp = ok(result, 200 if "error" not in result else 500)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return resp
+    except Exception as e:
+        log.error(f"/daily-ema error: {e}")
+        return ok({"error": str(e)}, 500)
+
+
 # GET /option_ltp?symbol=BANKNIFTY&expiry=2026-06-30&strikes=54500,54600
 # Used by StrategyBuilder journal for live P&L
 @app.route("/option_ltp")
