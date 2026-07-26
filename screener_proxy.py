@@ -2400,27 +2400,31 @@ def _daily_ema(symbol: str):
     if cached and (time.time() - cached["ts"]) < _daily_ema_cache_ttl:
         return cached["data"]
 
-    breeze_code = BREEZE_CODE_MAP.get(symbol)
-    if not breeze_code:
+    # Breeze's get_historical_data_v2 doesn't reliably serve "1day" index-spot
+    # candles (unlike its intraday intervals) — same reason StockRanker/GFS
+    # use yfinance for EOD data elsewhere in this file. Do the same here.
+    yf_symbol = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK"}.get(symbol)
+    if not yf_symbol:
         return {"error": f"Unsupported symbol: {symbol}"}
 
-    import pytz as _pytz_de
-    ist = _pytz_de.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
-    # 200-day EMA needs 200 daily bars to warm up; pad well past a year to
-    # comfortably absorb weekends/holidays.
-    from_dt = (now - timedelta(days=400)).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        df = yf.download(yf_symbol, period="2y", interval="1d",
+                          auto_adjust=True, progress=False, threads=False)
+    except Exception as e:
+        return {"error": f"yfinance fetch failed: {e}"}
 
-    # Default product_type/exchange_code -> NSE cash/index spot, continuous
-    # history (no futures expiry rollover issue for a 200-day lookback).
-    df = _breeze_candles(breeze_code, "1day", from_dt, now)
-    if df.empty:
-        return {"error": "No daily candle data returned from Breeze"}
+    if df.empty or len(df) < 200:
+        return {"error": f"Insufficient daily data ({len(df)} bars) for EMA200"}
 
-    ema20  = _compute_ema(df["Close"], 20)
-    ema50  = _compute_ema(df["Close"], 50)
-    ema200 = _compute_ema(df["Close"], 200)
-    ltp    = float(df["Close"].iloc[-1])
+    close = df["Close"]
+    # yfinance sometimes returns MultiIndex columns even for a single ticker
+    if hasattr(close, "columns"):
+        close = close.iloc[:, 0]
+
+    ema20  = _compute_ema(close, 20)
+    ema50  = _compute_ema(close, 50)
+    ema200 = _compute_ema(close, 200)
+    ltp    = float(close.iloc[-1])
 
     result = {
         "symbol": symbol,
@@ -2429,7 +2433,7 @@ def _daily_ema(symbol: str):
         "ema50": ema50,
         "ema200": ema200,
         "bars_used": len(df),
-        "time": now.isoformat(),
+        "time": datetime.now().isoformat(),
     }
     _daily_ema_cache[symbol] = {"data": result, "ts": time.time()}
     return result
