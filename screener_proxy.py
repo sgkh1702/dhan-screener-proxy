@@ -2460,16 +2460,18 @@ def daily_ema():
 _market_news_cache = {}
 _market_news_cache_ttl = 600  # 10 min — headlines don't need faster polling than this
 
-# Moneycontrol's official RSS feeds. There's no dedicated feed for the
-# curated "Stocks in the News" page (that's a hand-built page, not an RSS
-# category) — scraping that page would be fragile and break on any layout
-# change, so this uses their published feeds instead. Only feeds confirmed
-# to still be actively maintained are listed here — "business.xml" and
-# "marketreports.xml" (an earlier guess at the naming pattern) turned out to
-# serve stale/infrequently-updated content, so they've been dropped.
+# Moneycontrol's RSS feeds (previously used here) turned out to be frozen —
+# both latestnews.xml and business.xml were serving content stuck on the
+# same date (23 Apr 2024), confirmed via a live server-side fetch, not just
+# a stale cache somewhere in between. Switched to Business Standard's RSS
+# feeds instead, which returned genuinely current articles when checked.
+# There's still no dedicated feed for a curated "Stocks in the News" list —
+# scraping that kind of page would be fragile — so this uses their
+# published market-news categories instead.
 MONEYCONTROL_RSS_FEEDS = {
-    "latest": "https://www.moneycontrol.com/rss/latestnews.xml",
-    "top":    "https://www.moneycontrol.com/rss/MCtopnews.xml",
+    "markets": "https://www.business-standard.com/rss/markets-106.rss",
+    "stocks":  "https://www.business-standard.com/rss/markets/stock-market-news-10618.rss",
+    "top":     "https://www.business-standard.com/rss/home_page_top_stories.rss",
 }
 
 def _fetch_market_news(feed: str, limit: int):
@@ -2505,7 +2507,7 @@ def _fetch_market_news(feed: str, limit: int):
 # endpoint on every Daily Market View load.
 @app.route("/market-news")
 def market_news():
-    feed  = request.args.get("feed", "latest").lower()
+    feed  = request.args.get("feed", "markets").lower()
     try:
         limit = min(max(int(request.args.get("limit", 15)), 1), 50)
     except ValueError:
