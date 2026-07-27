@@ -30,7 +30,6 @@ from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import json, math, os, time, logging, threading, urllib.request, urllib.parse, calendar as _calendar
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from breeze_connect import BreezeConnect
@@ -2460,26 +2459,24 @@ def daily_ema():
 _market_news_cache = {}
 _market_news_cache_ttl = 600  # 10 min — headlines don't need faster polling than this
 
-# Direct publisher RSS feeds have failed twice: Moneycontrol's were frozen
-# (every pubDate stuck on 23 Apr 2024 — confirmed via a live server-side
-# fetch), and Business Standard's returned HTTP 403 (Render's server-side
-# requests are almost certainly being blocked as bot traffic, the same way
-# NSE blocks datacenter IPs elsewhere in this app). Switched to Google
-# News' RSS search instead — an aggregator across many publishers that's
-# built for exactly this kind of programmatic access, so it's far less
-# likely to block a plain server-side request the way an individual
-# publisher's own feed might.
-NEWS_RSS_QUERIES = {
-    "markets": 'Nifty OR Sensex OR "Indian stock market"',
-    "stocks":  '"stocks to watch" India',
-    "top":     "India business news markets",
+# Three RSS-scraping attempts all failed for different reasons: Moneycontrol's
+# feeds were frozen since 23 Apr 2024 (confirmed via a live server-side
+# fetch), Business Standard returned HTTP 403, and Google News RSS returned
+# HTTP 503 — a strong enough pattern to suggest Render's IP range is broadly
+# rate-limited/blocklisted by these providers, not a per-feed problem.
+# Switched to marketaux (https://www.marketaux.com), a JSON news API built
+# specifically for financial/stock market news — free tier, no payment
+# details required, ~100 requests/day. Needs MARKETAUX_API_KEY set as an
+# env var (sign up free at https://www.marketaux.com/register to get one).
+MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY", "")
+MARKETAUX_URL = "https://api.marketaux.com/v1/news/all"
+
+# Each feed is a set of marketaux query params merged with api_token/limit
+# at request time. countries=in scopes results to Indian-exchange entities.
+NEWS_FEED_PARAMS = {
+    "markets": {"countries": "in", "language": "en"},
+    "stocks":  {"countries": "in", "language": "en", "must_have_entities": "true", "entity_types": "equity,index"},
 }
-
-def _google_news_rss_url(query: str) -> str:
-    params = urllib.parse.urlencode({"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"})
-    return f"https://news.google.com/rss/search?{params}"
-
-NEWS_RSS_FEEDS = {key: _google_news_rss_url(q) for key, q in NEWS_RSS_QUERIES.items()}
 
 def _fetch_market_news(feed: str, limit: int):
     cache_key = feed
@@ -2487,22 +2484,33 @@ def _fetch_market_news(feed: str, limit: int):
     if cached and (time.time() - cached["ts"]) < _market_news_cache_ttl:
         return cached["data"]
 
-    url = NEWS_RSS_FEEDS.get(feed, NEWS_RSS_FEEDS["markets"])
+    if not MARKETAUX_API_KEY:
+        raise RuntimeError("MARKETAUX_API_KEY is not set — sign up free at marketaux.com and set it on Render")
+
+    params = dict(NEWS_FEED_PARAMS.get(feed, NEWS_FEED_PARAMS["markets"]))
+    params["api_token"] = MARKETAUX_API_KEY
+    params["limit"] = limit
+
+    url = f"{MARKETAUX_URL}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw = resp.read()
 
-    root = ET.fromstring(raw)
+    payload = json.loads(raw)
+    if "error" in payload:
+        raise RuntimeError(payload["error"].get("message", "marketaux error"))
+
     items = []
-    for item in root.findall(".//item"):
-        title   = (item.findtext("title") or "").strip()
-        link    = (item.findtext("link") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
-        source  = (item.findtext("source") or "").strip()
-        if title:
-            items.append({"title": title, "link": link, "pubDate": pub_date, "source": source})
-        if len(items) >= limit:
-            break
+    for a in payload.get("data", []):
+        title = (a.get("title") or "").strip()
+        if not title:
+            continue
+        items.append({
+            "title": title,
+            "link": a.get("url", ""),
+            "pubDate": a.get("published_at", ""),
+            "source": a.get("source", ""),
+        })
 
     result = {"feed": feed, "items": items, "fetched_at": datetime.now().isoformat()}
     _market_news_cache[cache_key] = {"data": result, "ts": time.time()}
@@ -2510,12 +2518,9 @@ def _fetch_market_news(feed: str, limit: int):
 
 
 # GET /market-news?feed=markets&limit=15
-# Headlines from Google News RSS search (see NEWS_RSS_QUERIES for the feed=
-# options and what each one searches for). Cached 10 min per feed to avoid
-# hammering the endpoint on every Daily Market View load. Note: links point
-# through a Google redirect (news.google.com/rss/articles/...) rather than
-# directly at the publisher — normal for Google News RSS, still resolves to
-# the real article when clicked.
+# Headlines from marketaux (see NEWS_FEED_PARAMS for the feed= options).
+# Cached 10 min per feed to stay well within the free plan's daily request
+# allowance. Requires MARKETAUX_API_KEY to be set as an env var on Render.
 @app.route("/market-news")
 def market_news():
     feed  = request.args.get("feed", "markets").lower()
@@ -2523,13 +2528,16 @@ def market_news():
         limit = min(max(int(request.args.get("limit", 15)), 1), 50)
     except ValueError:
         limit = 15
-    if feed not in NEWS_RSS_FEEDS:
-        return ok({"error": f"Unsupported feed: {feed}. Choose from {list(NEWS_RSS_FEEDS)}"}, 400)
+    if feed not in NEWS_FEED_PARAMS:
+        return ok({"error": f"Unsupported feed: {feed}. Choose from {list(NEWS_FEED_PARAMS)}"}, 400)
     try:
         result = _fetch_market_news(feed, limit)
         resp = ok(result, 200)
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return resp
+    except Exception as e:
+        log.error(f"/market-news error: {e}")
+        return ok({"error": str(e), "items": []}, 500)
     except Exception as e:
         log.error(f"/market-news error: {e}")
         return ok({"error": str(e), "items": []}, 500)
