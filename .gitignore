@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.env
+logs/
+research_cache.db
+cache_state.json
+optionchain-494805-d75aa6f9c7a0.json

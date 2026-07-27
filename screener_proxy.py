@@ -30,6 +30,7 @@ from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import json, math, os, time, logging, threading, urllib.request, calendar as _calendar
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from breeze_connect import BreezeConnect
@@ -2454,6 +2455,70 @@ def daily_ema():
     except Exception as e:
         log.error(f"/daily-ema error: {e}")
         return ok({"error": str(e)}, 500)
+
+
+_market_news_cache = {}
+_market_news_cache_ttl = 600  # 10 min — headlines don't need faster polling than this
+
+# Moneycontrol's official RSS feeds. There's no dedicated feed for the
+# curated "Stocks in the News" page (that's a hand-built page, not an RSS
+# category) — scraping that page would be fragile and break on any layout
+# change, so this uses their published feeds instead. "business" is the
+# closest fit to stock/company-moving news; "latest" is unfiltered.
+MONEYCONTROL_RSS_FEEDS = {
+    "latest":   "https://www.moneycontrol.com/rss/latestnews.xml",
+    "business": "https://www.moneycontrol.com/rss/business.xml",
+    "markets":  "https://www.moneycontrol.com/rss/marketreports.xml",
+}
+
+def _fetch_market_news(feed: str, limit: int):
+    cache_key = feed
+    cached = _market_news_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < _market_news_cache_ttl:
+        return cached["data"]
+
+    url = MONEYCONTROL_RSS_FEEDS.get(feed, MONEYCONTROL_RSS_FEEDS["latest"])
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read()
+
+    root = ET.fromstring(raw)
+    items = []
+    for item in root.findall(".//item"):
+        title   = (item.findtext("title") or "").strip()
+        link    = (item.findtext("link") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        if title:
+            items.append({"title": title, "link": link, "pubDate": pub_date})
+        if len(items) >= limit:
+            break
+
+    result = {"feed": feed, "items": items, "fetched_at": datetime.now().isoformat()}
+    _market_news_cache[cache_key] = {"data": result, "ts": time.time()}
+    return result
+
+
+# GET /market-news?feed=business&limit=15
+# Headlines from Moneycontrol's official RSS feeds (see MONEYCONTROL_RSS_FEEDS
+# for the feed= options). Cached 10 min per feed to avoid hammering their RSS
+# endpoint on every Daily Market View load.
+@app.route("/market-news")
+def market_news():
+    feed  = request.args.get("feed", "business").lower()
+    try:
+        limit = min(max(int(request.args.get("limit", 15)), 1), 50)
+    except ValueError:
+        limit = 15
+    if feed not in MONEYCONTROL_RSS_FEEDS:
+        return ok({"error": f"Unsupported feed: {feed}. Choose from {list(MONEYCONTROL_RSS_FEEDS)}"}, 400)
+    try:
+        result = _fetch_market_news(feed, limit)
+        resp = ok(result, 200)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return resp
+    except Exception as e:
+        log.error(f"/market-news error: {e}")
+        return ok({"error": str(e), "items": []}, 500)
 
 
 # GET /option_ltp?symbol=BANKNIFTY&expiry=2026-06-30&strikes=54500,54600
