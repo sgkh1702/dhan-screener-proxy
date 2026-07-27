@@ -2480,7 +2480,7 @@ def _fetch_market_news(feed: str, limit: int):
     if cached and (time.time() - cached["ts"]) < _market_news_cache_ttl:
         return cached["data"]
 
-    url = MONEYCONTROL_RSS_FEEDS.get(feed, MONEYCONTROL_RSS_FEEDS["latest"])
+    url = MONEYCONTROL_RSS_FEEDS.get(feed, MONEYCONTROL_RSS_FEEDS["markets"])
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw = resp.read()
