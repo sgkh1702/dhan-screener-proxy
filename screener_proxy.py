@@ -2463,12 +2463,13 @@ _market_news_cache_ttl = 600  # 10 min — headlines don't need faster polling t
 # Moneycontrol's official RSS feeds. There's no dedicated feed for the
 # curated "Stocks in the News" page (that's a hand-built page, not an RSS
 # category) — scraping that page would be fragile and break on any layout
-# change, so this uses their published feeds instead. "business" is the
-# closest fit to stock/company-moving news; "latest" is unfiltered.
+# change, so this uses their published feeds instead. Only feeds confirmed
+# to still be actively maintained are listed here — "business.xml" and
+# "marketreports.xml" (an earlier guess at the naming pattern) turned out to
+# serve stale/infrequently-updated content, so they've been dropped.
 MONEYCONTROL_RSS_FEEDS = {
-    "latest":   "https://www.moneycontrol.com/rss/latestnews.xml",
-    "business": "https://www.moneycontrol.com/rss/business.xml",
-    "markets":  "https://www.moneycontrol.com/rss/marketreports.xml",
+    "latest": "https://www.moneycontrol.com/rss/latestnews.xml",
+    "top":    "https://www.moneycontrol.com/rss/MCtopnews.xml",
 }
 
 def _fetch_market_news(feed: str, limit: int):
@@ -2504,7 +2505,7 @@ def _fetch_market_news(feed: str, limit: int):
 # endpoint on every Daily Market View load.
 @app.route("/market-news")
 def market_news():
-    feed  = request.args.get("feed", "business").lower()
+    feed  = request.args.get("feed", "latest").lower()
     try:
         limit = min(max(int(request.args.get("limit", 15)), 1), 50)
     except ValueError:
