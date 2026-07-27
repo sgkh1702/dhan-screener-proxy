@@ -29,7 +29,7 @@ from flask import Flask, request
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
-import json, math, os, time, logging, threading, urllib.request, calendar as _calendar
+import json, math, os, time, logging, threading, urllib.request, urllib.parse, calendar as _calendar
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -2460,19 +2460,26 @@ def daily_ema():
 _market_news_cache = {}
 _market_news_cache_ttl = 600  # 10 min — headlines don't need faster polling than this
 
-# Moneycontrol's RSS feeds (previously used here) turned out to be frozen —
-# both latestnews.xml and business.xml were serving content stuck on the
-# same date (23 Apr 2024), confirmed via a live server-side fetch, not just
-# a stale cache somewhere in between. Switched to Business Standard's RSS
-# feeds instead, which returned genuinely current articles when checked.
-# There's still no dedicated feed for a curated "Stocks in the News" list —
-# scraping that kind of page would be fragile — so this uses their
-# published market-news categories instead.
-MONEYCONTROL_RSS_FEEDS = {
-    "markets": "https://www.business-standard.com/rss/markets-106.rss",
-    "stocks":  "https://www.business-standard.com/rss/markets/stock-market-news-10618.rss",
-    "top":     "https://www.business-standard.com/rss/home_page_top_stories.rss",
+# Direct publisher RSS feeds have failed twice: Moneycontrol's were frozen
+# (every pubDate stuck on 23 Apr 2024 — confirmed via a live server-side
+# fetch), and Business Standard's returned HTTP 403 (Render's server-side
+# requests are almost certainly being blocked as bot traffic, the same way
+# NSE blocks datacenter IPs elsewhere in this app). Switched to Google
+# News' RSS search instead — an aggregator across many publishers that's
+# built for exactly this kind of programmatic access, so it's far less
+# likely to block a plain server-side request the way an individual
+# publisher's own feed might.
+NEWS_RSS_QUERIES = {
+    "markets": 'Nifty OR Sensex OR "Indian stock market"',
+    "stocks":  '"stocks to watch" India',
+    "top":     "India business news markets",
 }
+
+def _google_news_rss_url(query: str) -> str:
+    params = urllib.parse.urlencode({"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"})
+    return f"https://news.google.com/rss/search?{params}"
+
+NEWS_RSS_FEEDS = {key: _google_news_rss_url(q) for key, q in NEWS_RSS_QUERIES.items()}
 
 def _fetch_market_news(feed: str, limit: int):
     cache_key = feed
@@ -2480,7 +2487,7 @@ def _fetch_market_news(feed: str, limit: int):
     if cached and (time.time() - cached["ts"]) < _market_news_cache_ttl:
         return cached["data"]
 
-    url = MONEYCONTROL_RSS_FEEDS.get(feed, MONEYCONTROL_RSS_FEEDS["markets"])
+    url = NEWS_RSS_FEEDS.get(feed, NEWS_RSS_FEEDS["markets"])
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw = resp.read()
@@ -2491,8 +2498,9 @@ def _fetch_market_news(feed: str, limit: int):
         title   = (item.findtext("title") or "").strip()
         link    = (item.findtext("link") or "").strip()
         pub_date = (item.findtext("pubDate") or "").strip()
+        source  = (item.findtext("source") or "").strip()
         if title:
-            items.append({"title": title, "link": link, "pubDate": pub_date})
+            items.append({"title": title, "link": link, "pubDate": pub_date, "source": source})
         if len(items) >= limit:
             break
 
@@ -2501,10 +2509,13 @@ def _fetch_market_news(feed: str, limit: int):
     return result
 
 
-# GET /market-news?feed=business&limit=15
-# Headlines from Moneycontrol's official RSS feeds (see MONEYCONTROL_RSS_FEEDS
-# for the feed= options). Cached 10 min per feed to avoid hammering their RSS
-# endpoint on every Daily Market View load.
+# GET /market-news?feed=markets&limit=15
+# Headlines from Google News RSS search (see NEWS_RSS_QUERIES for the feed=
+# options and what each one searches for). Cached 10 min per feed to avoid
+# hammering the endpoint on every Daily Market View load. Note: links point
+# through a Google redirect (news.google.com/rss/articles/...) rather than
+# directly at the publisher — normal for Google News RSS, still resolves to
+# the real article when clicked.
 @app.route("/market-news")
 def market_news():
     feed  = request.args.get("feed", "markets").lower()
@@ -2512,8 +2523,8 @@ def market_news():
         limit = min(max(int(request.args.get("limit", 15)), 1), 50)
     except ValueError:
         limit = 15
-    if feed not in MONEYCONTROL_RSS_FEEDS:
-        return ok({"error": f"Unsupported feed: {feed}. Choose from {list(MONEYCONTROL_RSS_FEEDS)}"}, 400)
+    if feed not in NEWS_RSS_FEEDS:
+        return ok({"error": f"Unsupported feed: {feed}. Choose from {list(NEWS_RSS_FEEDS)}"}, 400)
     try:
         result = _fetch_market_news(feed, limit)
         resp = ok(result, 200)
