@@ -19,6 +19,8 @@ Endpoints:
   GET  /option_ltp      -> CE/PE LTP for specific strikes via Breeze API
   GET  /stock-ranks     -> Momentum + Retracement ranking from DailyShortlist tab
   GET  /futures-signal  -> EMA20/50 + VWAP + volume trend light for Nifty/BankNifty futures
+  GET  /pattern-scan-daily    -> chart pattern scan (triangles/wedges) over EOD candles, yfinance, full Nifty 500
+  GET  /pattern-scan-intraday -> chart pattern scan over 5-min candles, Breeze, F&O (n200) universe
 
 Run:
     pip install flask yfinance flask-cors pandas gspread google-auth pytz
@@ -34,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from breeze_connect import BreezeConnect
 from breeze_symbol_map import NSE_TO_BREEZE
+from pattern_detector import classify as _classify_pattern
 
 app = Flask(__name__)
 CORS(app)
@@ -2570,6 +2573,259 @@ def option_ltp():
         log.error(f"/option_ltp: {e}")
         return ok({"error": str(e), "spot": None, "data": {}}), 500
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PATTERN SCANNER (chart pattern detection: triangles + wedges)
+# Phase 2 of the pattern-detection feature. Phase 1 (pattern_detector.py) was
+# built and validated standalone with a synthetic self-test plus real-data
+# checks against the Nifty 50 — see that file for the detection algorithm
+# itself. This section just wires it into the existing screener conventions:
+# universe resolution matches /swing and /gfs (UNIVERSE_SETS, read_fno_csv),
+# daily scan uses one batched yf.download call the same way GFS does.
+# ──────────────────────────────────────────────────────────────────────────────
+
+PATTERN_SCAN_WINDOWS = [40, 60, 80, 100, 130]   # bars — same defaults used during Phase 1 validation
+PATTERN_MIN_QUALITY  = 50.0                      # quality floor below which a hit isn't returned
+
+
+def _pattern_result_to_dict(result, symbol, window, dates):
+    """
+    Serialize a pattern_detector.PatternResult (only ever called on a
+    qualifying result) into JSON-safe native types.
+
+    `dates` is the pandas DatetimeIndex slice for exactly the window that
+    was classified. Included in full (not just start/end) along with each
+    trendline's slope/intercept — which are already in window-local bar-index
+    units (0..len(window)-1) — so Phase 4's Lightweight Charts overlay can
+    reconstruct each line's real (date, price) endpoints later without
+    needing to recompute anything.
+    """
+    def line_dict(line):
+        return {
+            "slope":         round(float(line.slope), 6),
+            "intercept":     round(float(line.intercept), 4),
+            "r2":            round(float(line.r2), 4),
+            "slope_pct":     round(float(line.slope_pct), 4),
+            "resid_std_pct": round(float(line.resid_std_pct), 4),
+            "touches":       int(line.touches),
+        }
+    is_intraday = hasattr(dates[0], "strftime") and hasattr(dates[0], "hour")
+    fmt = "%Y-%m-%d %H:%M" if is_intraday else "%Y-%m-%d"
+    return {
+        "symbol":     symbol,
+        "pattern":    result.pattern,
+        "quality":    result.quality,
+        "breakout":   result.breakout,
+        "window":     window,
+        "start_date": dates[0].strftime(fmt),
+        "end_date":   dates[-1].strftime(fmt),
+        "dates":      [d.strftime(fmt) for d in dates],
+        "upper":      line_dict(result.upper),
+        "lower":      line_dict(result.lower),
+    }
+
+
+def _resolve_universe(universe_key, full_default=True):
+    """Same universe resolution used by /swing and /gfs. full_default=True
+    means an unrecognized-but-'full' key (fno/n500) returns the whole
+    read_fno_csv() list; set False for routes where that should be an error."""
+    all_fno = read_fno_csv()
+    if universe_key in ("fno", "n500"):
+        return all_fno
+    if universe_key in UNIVERSE_SETS:
+        return [s for s in all_fno if s in UNIVERSE_SETS[universe_key]]
+    return None
+
+
+def _run_pattern_scan_daily(universe_key="n500", windows=None, min_quality=PATTERN_MIN_QUALITY):
+    """
+    EOD chart-pattern scan over daily candles via yfinance — full Nifty 500
+    by default (universe=n500/fno both resolve to the full read_fno_csv()
+    list, same as /swing and /gfs).
+    """
+    windows = windows or PATTERN_SCAN_WINDOWS
+    symbols = _resolve_universe(universe_key)
+    if symbols is None:
+        return {"error": f"Unknown universe '{universe_key}'"}
+    if not symbols:
+        return {"data": [], "count": 0, "scanned": 0}
+
+    log.info(f"pattern-scan-daily: scanning {len(symbols)} stocks, windows={windows}")
+    t0 = time.time()
+    tickers = [to_yf(s) for s in symbols]
+    multi = len(tickers) > 1
+
+    try:
+        raw = yf.download(tickers, period="1y", interval="1d",
+                           group_by="ticker", auto_adjust=True, progress=False, threads=False)
+    except Exception as e:
+        log.error(f"pattern-scan-daily fetch: {e}")
+        return {"error": str(e)}
+
+    keys = list(raw.columns.get_level_values(0)) if multi and not raw.empty else []
+    hits = []
+    scanned = 0
+
+    for sym in symbols:
+        yf_sym = to_yf(sym)
+        try:
+            if multi:
+                if yf_sym not in keys:
+                    continue
+                df = raw[yf_sym]
+            else:
+                df = raw
+            df = df.dropna(subset=["Close"])
+            if len(df) < min(windows):
+                continue
+            scanned += 1
+            high, low, close = df["High"].to_numpy(), df["Low"].to_numpy(), df["Close"].to_numpy()
+            dates = df.index
+            n = len(close)
+            for w in windows:
+                if w > n:
+                    continue
+                result = _classify_pattern(high[-w:], low[-w:], close[-w:])
+                if result.pattern and result.quality >= min_quality:
+                    hits.append(_pattern_result_to_dict(result, sym, w, dates[-w:]))
+        except Exception as e:
+            log.debug(f"pattern-scan-daily {sym}: {e}")
+            continue
+
+    hits.sort(key=lambda h: -h["quality"])
+    log.info(f"pattern-scan-daily done in {round(time.time()-t0)}s — "
+             f"{len(hits)} hits from {scanned}/{len(symbols)} stocks")
+    return {
+        "data": hits, "count": len(hits), "scanned": scanned, "universe": universe_key,
+        "windows": windows, "min_quality": min_quality, "time": datetime.now().isoformat(),
+    }
+
+
+def _pattern_scan_intraday_one(sym, breeze_code, from_dt, now, windows, min_quality):
+    df = _breeze_candles(breeze_code, "5minute", from_dt, now, exchange_code="NSE")
+    if df.empty:
+        return []
+    high, low, close = df["High"].to_numpy(), df["Low"].to_numpy(), df["Close"].to_numpy()
+    dates = df.index
+    n = len(close)
+    hits = []
+    for w in windows:
+        if w > n:
+            continue
+        result = _classify_pattern(high[-w:], low[-w:], close[-w:])
+        if result.pattern and result.quality >= min_quality:
+            hits.append(_pattern_result_to_dict(result, sym, w, dates[-w:]))
+    return hits
+
+
+def _run_pattern_scan_intraday(universe_key="n200", windows=None, min_quality=PATTERN_MIN_QUALITY,
+                                lookback_days=10, max_workers=8):
+    """
+    Intraday chart-pattern scan over 5-min Breeze candles — F&O universe
+    (n200, ~200 stocks) by default, not the full Nifty 500, since Breeze
+    coverage doesn't extend as cleanly as yfinance's does for EOD data.
+
+    This is new ground for this file: NSE_TO_BREEZE (imported at the top,
+    previously unused here) maps each stock symbol to its Breeze code —
+    every existing Breeze usage elsewhere in this file is index/futures-only
+    (BREEZE_CODE_MAP). Per-symbol calls are fanned out with a
+    ThreadPoolExecutor since Breeze has no multi-symbol batch endpoint the
+    way yfinance's yf.download does. NOT YET LOAD-TESTED against Breeze's
+    real rate limits at max_workers=8 with a ~200-symbol universe — worth
+    starting with a smaller universe (n50) or lower max_workers if you see
+    session/rate-limit errors in the logs.
+    """
+    windows = windows or PATTERN_SCAN_WINDOWS
+    symbols = _resolve_universe(universe_key)
+    if symbols is None:
+        return {"error": f"Unknown universe '{universe_key}'"}
+    if not symbols:
+        return {"data": [], "count": 0, "scanned": 0}
+
+    import pytz as _pytz_ps
+    ist = _pytz_ps.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    from_dt = (now - timedelta(days=lookback_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    log.info(f"pattern-scan-intraday: scanning up to {len(symbols)} stocks, windows={windows}")
+    t0 = time.time()
+    hits, scanned, skipped_no_code = [], 0, 0
+
+    def _worker(sym):
+        breeze_code = NSE_TO_BREEZE.get(sym)
+        if not breeze_code:
+            return sym, None
+        try:
+            return sym, _pattern_scan_intraday_one(sym, breeze_code, from_dt, now, windows, min_quality)
+        except Exception as e:
+            log.debug(f"pattern-scan-intraday {sym}: {e}")
+            return sym, []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_worker, sym) for sym in symbols]
+        for fut in futures:
+            sym, sym_hits = fut.result()
+            if sym_hits is None:
+                skipped_no_code += 1
+                continue
+            scanned += 1
+            hits.extend(sym_hits)
+
+    hits.sort(key=lambda h: -h["quality"])
+    log.info(f"pattern-scan-intraday done in {round(time.time()-t0)}s — "
+             f"{len(hits)} hits from {scanned}/{len(symbols)} stocks "
+             f"({skipped_no_code} skipped, no Breeze code)")
+    return {
+        "data": hits, "count": len(hits), "scanned": scanned, "skipped_no_code": skipped_no_code,
+        "universe": universe_key, "windows": windows, "min_quality": min_quality,
+        "time": datetime.now().isoformat(),
+    }
+
+
+@app.route("/pattern-scan-daily")
+def pattern_scan_daily():
+    """
+    Chart pattern scan (Ascending/Descending/Symmetrical Triangle,
+    Rising/Falling Wedge) over EOD daily candles via yfinance.
+    Query params:
+      universe    : fno | n50 | nn50 | n200 | n500  (default: n500 — full Nifty 500)
+      windows     : comma-separated bar counts, e.g. 40,60,80,100,130 (default: same)
+      min_quality : float 0-100 (default: 50)
+    """
+    try:
+        universe_key  = request.args.get("universe", "n500").lower()
+        windows_param = request.args.get("windows", "")
+        windows       = [int(w) for w in windows_param.split(",") if w.strip()] if windows_param else None
+        min_quality   = float(request.args.get("min_quality", PATTERN_MIN_QUALITY))
+        result = _run_pattern_scan_daily(universe_key, windows, min_quality)
+        return ok(result)
+    except Exception as e:
+        log.error(f"/pattern-scan-daily: {e}")
+        return ok({"error": str(e)}, 500)
+
+
+@app.route("/pattern-scan-intraday")
+def pattern_scan_intraday():
+    """
+    Chart pattern scan over 5-min intraday candles via Breeze.
+    Query params:
+      universe      : n200 | n50 | nn50 | fno  (default: n200 — F&O universe)
+      windows       : comma-separated bar counts (default: 40,60,80,100,130)
+      min_quality   : float 0-100 (default: 50)
+      lookback_days : calendar days of 5-min history to pull (default: 10)
+    """
+    try:
+        universe_key  = request.args.get("universe", "n200").lower()
+        windows_param = request.args.get("windows", "")
+        windows       = [int(w) for w in windows_param.split(",") if w.strip()] if windows_param else None
+        min_quality   = float(request.args.get("min_quality", PATTERN_MIN_QUALITY))
+        lookback_days = int(request.args.get("lookback_days", 10))
+        result = _run_pattern_scan_intraday(universe_key, windows, min_quality, lookback_days)
+        return ok(result)
+    except Exception as e:
+        log.error(f"/pattern-scan-intraday: {e}")
+        return ok({"error": str(e)}, 500)
 
 
 if __name__ == "__main__":
