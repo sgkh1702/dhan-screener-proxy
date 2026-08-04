@@ -452,26 +452,6 @@ def read_fno_csv() -> list:
     symbols = [str(s).strip().upper() for s in df.iloc[:,0].dropna() if str(s).strip()]
     return symbols
 
-# ── Nifty500List.csv reader ────────────────────────────────────────────────────
-# Added so universe=n500 means the actual Nifty 500, not the F&O list.
-# Nifty500List.csv is the same file nse_corporate_actions.py already reads
-# (Symbol/Company/Industry columns) — needs to be copied into this backend's
-# folder (and committed/pushed) for it to take effect on Render. Falls back
-# to the F&O list if it's not found, so nothing breaks before that happens —
-# n500 just silently stays at its old (smaller) behavior until the file is
-# actually deployed alongside it.
-NIFTY500_CSV = os.path.join(BASE_DIR, "Nifty500List.csv")
-
-def read_nifty500_csv() -> list:
-    if not os.path.exists(NIFTY500_CSV):
-        log.warning(f"Nifty500List.csv not found at {NIFTY500_CSV} — "
-                    f"falling back to the F&O list for universe=n500")
-        return read_fno_csv()
-    df = pd.read_csv(NIFTY500_CSV)
-    col = "Symbol" if "Symbol" in df.columns else df.columns[0]
-    symbols = [str(s).strip().upper() for s in df[col].dropna() if str(s).strip()]
-    return symbols
-
 # ── yfinance symbol mapping ────────────────────────────────────────────────────
 YF_MAP = {
     "M&M":        "M&M.NS",
@@ -2647,16 +2627,11 @@ def _pattern_result_to_dict(result, symbol, window, dates):
 
 
 def _resolve_universe(universe_key, full_default=True):
-    """Universe resolution for the pattern-scan routes specifically.
-    Unlike /swing and /gfs (which still alias n500 -> the F&O list — see
-    the n500/fno labeling note in project memory for why those weren't
-    touched here), n500 now reads the real Nifty 500 via
-    read_nifty500_csv(). fno and the UNIVERSE_SETS subsets (n50/nn50/n200)
-    are unchanged."""
-    if universe_key == "n500":
-        return read_nifty500_csv()
+    """Same universe resolution used by /swing and /gfs. full_default=True
+    means an unrecognized-but-'full' key (fno/n500) returns the whole
+    read_fno_csv() list; set False for routes where that should be an error."""
     all_fno = read_fno_csv()
-    if universe_key == "fno":
+    if universe_key in ("fno", "n500"):
         return all_fno
     if universe_key in UNIVERSE_SETS:
         return [s for s in all_fno if s in UNIVERSE_SETS[universe_key]]
@@ -2666,9 +2641,8 @@ def _resolve_universe(universe_key, full_default=True):
 def _run_pattern_scan_daily(universe_key="n500", windows=None, min_quality=PATTERN_MIN_QUALITY):
     """
     EOD chart-pattern scan over daily candles via yfinance — full Nifty 500
-    by default (universe=n500 now reads the real Nifty 500 list via
-    read_nifty500_csv(); universe=fno still resolves to the F&O list, as
-    do the UNIVERSE_SETS subsets).
+    by default (universe=n500/fno both resolve to the full read_fno_csv()
+    list, same as /swing and /gfs).
     """
     windows = windows or PATTERN_SCAN_WINDOWS
     symbols = _resolve_universe(universe_key)
@@ -2853,6 +2827,124 @@ def pattern_scan_intraday():
         log.error(f"/pattern-scan-intraday: {e}")
         return ok({"error": str(e)}, 500)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 4 of the pattern-detection feature: raw OHLC candle route.
+#
+# Nothing existing in this file returns raw candles to the frontend — every
+# route (/swing, /gfs, /pattern-scan-daily, etc.) computes derived values
+# server-side and only ever ships the derived result. The Pattern Scanner's
+# chart-overlay panel needs actual candles to draw underneath the trendlines
+# that /pattern-scan-daily and /pattern-scan-intraday already return (slope +
+# intercept only, no price data), so this is genuinely new ground.
+#
+# source=daily    -> yfinance, same to_yf() mapping used everywhere else.
+# source=intraday -> Breeze 5-min candles via the existing _breeze_candles()
+#                     helper (same one /pattern-scan-intraday uses internally).
+#
+# `pad` bars are added on each side of [start_date, end_date] for chart
+# context beyond just the pattern's own window — defaults to 20, matching
+# the Phase 4 handover assumption (flagged to Sanjay, not yet confirmed as
+# his preference vs. exact-window-only).
+# ──────────────────────────────────────────────────────────────────────────────
+
+CANDLE_PAD_BARS = 20  # bars of extra context on each side of the pattern window
+
+
+def _candles_daily(symbol, start_date, end_date, pad=CANDLE_PAD_BARS):
+    """
+    yfinance daily OHLC for one symbol. Pulls 1y (same as pattern-scan-daily
+    uses) then slices to [start_date - pad bars, end_date + pad bars] so the
+    chart shows some context on both sides of the pattern window itself.
+    """
+    yf_sym = to_yf(symbol)
+    df = yf.download(yf_sym, period="1y", interval="1d",
+                      auto_adjust=True, progress=False, threads=False)
+    if df.empty:
+        return pd.DataFrame()
+    # yf.download on a single ticker can still come back with a MultiIndex
+    # column header in some yfinance versions — flatten defensively.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna(subset=["Close"])
+
+    start_ts = pd.Timestamp(start_date)
+    end_ts   = pd.Timestamp(end_date)
+    # locate positions, then pad by bar count (not calendar days) so weekends
+    # / holidays don't shrink the requested context
+    idx = df.index
+    start_pos = idx.searchsorted(start_ts)
+    end_pos   = idx.searchsorted(end_ts, side="right")
+    start_pos = max(0, start_pos - pad)
+    end_pos   = min(len(idx), end_pos + pad)
+    return df.iloc[start_pos:end_pos]
+
+
+def _candles_intraday(symbol, start_date, end_date, pad=CANDLE_PAD_BARS):
+    """
+    Breeze 5-min OHLC for one symbol. Breeze has no "give me N bars either
+    side" primitive, so pad is approximated as pad*5 minutes on each side —
+    good enough for chart-context purposes, not meant to be exact.
+    """
+    breeze_code = NSE_TO_BREEZE.get(symbol)
+    if not breeze_code:
+        return pd.DataFrame()
+    import pytz as _pytz_c
+    ist = _pytz_c.timezone("Asia/Kolkata")
+    start_dt = pd.Timestamp(start_date).tz_localize(ist) - timedelta(minutes=5 * pad)
+    end_dt   = pd.Timestamp(end_date).tz_localize(ist) + timedelta(minutes=5 * pad)
+    return _breeze_candles(breeze_code, "5minute", start_dt, end_dt, exchange_code="NSE")
+
+
+@app.route("/candles")
+def candles():
+    """
+    Raw OHLC candles for the Pattern Scanner's chart overlay panel (Phase 4).
+    Not used by any other route — /pattern-scan-daily and /pattern-scan-intraday
+    return trendline slope/intercept only, never price series.
+
+    Query params:
+      symbol      : required, e.g. TATAPOWER
+      source      : daily | intraday  (default: daily)
+      start_date  : required, e.g. 2026-04-13 (or 2026-04-13 09:15 for intraday)
+      end_date    : required, e.g. 2026-08-04
+      pad         : int, extra bars of context each side (default: 20)
+    """
+    try:
+        symbol     = request.args.get("symbol", "").strip().upper()
+        source     = request.args.get("source", "daily").lower()
+        start_date = request.args.get("start_date", "")
+        end_date   = request.args.get("end_date", "")
+        pad        = int(request.args.get("pad", CANDLE_PAD_BARS))
+
+        if not symbol or not start_date or not end_date:
+            return ok({"error": "symbol, start_date and end_date are required"}, 400)
+
+        if source == "daily":
+            df = _candles_daily(symbol, start_date, end_date, pad)
+        elif source == "intraday":
+            df = _candles_intraday(symbol, start_date, end_date, pad)
+        else:
+            return ok({"error": f"Unknown source '{source}'"}, 400)
+
+        if df.empty:
+            return ok({"symbol": symbol, "source": source, "candles": [], "count": 0})
+
+        is_intraday = source == "intraday"
+        fmt = "%Y-%m-%d %H:%M" if is_intraday else "%Y-%m-%d"
+        out = [
+            {
+                "time":  ts.strftime(fmt),
+                "open":  round(float(row["Open"]), 4),
+                "high":  round(float(row["High"]), 4),
+                "low":   round(float(row["Low"]), 4),
+                "close": round(float(row["Close"]), 4),
+            }
+            for ts, row in df.iterrows()
+        ]
+        return ok({"symbol": symbol, "source": source, "candles": out, "count": len(out)})
+    except Exception as e:
+        log.error(f"/candles: {e}")
+        return ok({"error": str(e)}, 500)
 
 if __name__ == "__main__":
     connect_sheets()
