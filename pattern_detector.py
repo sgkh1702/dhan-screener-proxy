@@ -1,12 +1,18 @@
 """
 pattern_detector.py
 Phase 1 — standalone core chart-pattern detection algorithm.
+Revision 2 — adds Rectangle and Broadening Wedge (Group A of the
+post-Phase-4 pattern expansion; Group B — Double Top/Bottom, Head &
+Shoulders, Flags/Pennants — needs a different peak/trough-matching
+approach and isn't part of this revision).
 
 Detects: Ascending Triangle, Descending Triangle, Symmetrical Triangle,
-Rising Wedge, Falling Wedge — from OHLC swing-point structure.
+Rising Wedge, Falling Wedge, Rectangle, Broadening Wedge — from OHLC
+swing-point structure.
 
 No app/data dependencies. Pure numpy/scipy. Meant to be validated against
-synthetic data (see self-test at the bottom) before Phase 2 (backend routes).
+synthetic data (see self-test at the bottom) before this revision is wired
+into the backend/frontend, same discipline as the original Phase 1 build.
 
 Design
 ------
@@ -16,10 +22,12 @@ Design
    %-per-bar relative to mean price, so thresholds are scale-independent)
    and R^2 (fit quality).
 3. Classify pattern from the *sign* of each line's slope relative to a
-   flat-slope threshold, PROVIDED the lines are converging
-   (upper_slope < lower_slope, i.e. the gap between them shrinks as the
-   pattern progresses):
+   flat-slope threshold, branching first on whether the two lines are
+   CONVERGING, DIVERGING, or roughly PARALLEL (gap shrinking, growing, or
+   holding steady as the pattern progresses):
 
+   Converging (upper.slope < lower.slope — original Phase-1 logic,
+   unchanged in this revision):
         upper \\ lower      flat          up              down
         --------------------------------------------------------
         flat               (n/a, both     Ascending       Descending
@@ -29,11 +37,17 @@ Design
         down               --             Symmetrical      Falling Wedge
                                            Triangle
 
-   (up/up and down/down are wedges; the down/up combination is the
-   symmetrical triangle; flat/up and down/flat are the two right
-   triangles.)
-4. Quality score blends line fit (R^2), the number of touches on each
-   line, and how tightly the lines are converging.
+   Diverging (upper.slope meaningfully > lower.slope — new in this
+   revision): only (up, down) — rising highs + falling lows — is
+   currently mapped, to "Broadening Wedge" (the classic megaphone).
+
+   Parallel (upper.slope ≈ lower.slope, within MIN_SLOPE_DIFF_PCT — new
+   in this revision): both lines must individually classify as "flat"
+   -> "Rectangle" (a horizontal trading range).
+
+4. Quality score blends line fit (R^2), touch count, gap openness, a
+   shape-specific term (how well the pattern narrowed / widened / stayed
+   flat, depending on which branch classified it), and containment.
 5. Breakout check: is the latest close beyond either trendline's
    projected value (with a small buffer)?
 """
@@ -59,6 +73,24 @@ MIN_CONTAINMENT_PCT = 0.85  # fraction of ALL bars (not just swing points) whose
                               # coincidentally regresses through a few narrowing swing extremes
 CONTAINMENT_TOLERANCE_PCT = 0.5  # % of mean price allowed to poke outside the line before counting as a breach
 BREAKOUT_BUFFER_PCT = 0.15  # % beyond the line to count as a breakout
+
+# ----------------------------------------------------------------------
+# New in this revision: Rectangle + Broadening Wedge thresholds.
+# Kept entirely separate from the constants above so the original
+# converging (triangle/wedge) pipeline is byte-for-byte unchanged from
+# Phase 1 — these only govern the two new non-converging branches.
+# ----------------------------------------------------------------------
+MIN_SLOPE_DIFF_PCT = 0.02      # |lower.slope_pct - upper.slope_pct| at/below this counts as "parallel"
+                                 # (Rectangle candidate) rather than genuinely diverging
+
+MIN_DIVERGENCE_GAP_PCT = 0.5    # lines must start out at least this far apart (mirrors MIN_CONVERGENCE_GAP_PCT)
+MIN_WIDENING_RATIO = 1.3        # gap must grow to at least this multiple of the starting gap by window's end
+WIDENING_SCORE_REF = 2.0        # widening_ratio treated as "full marks" for the quality score's shape term
+
+MIN_RECTANGLE_GAP_PCT = 1.0     # channel must have a real range, not near-zero noise (rectangles need more
+                                  # room than triangles' minimum, since there's no apex to justify a tight range)
+RECTANGLE_GAP_DRIFT_MIN = 0.7   # gap1/gap0 must stay within this band -> genuinely parallel, not secretly
+RECTANGLE_GAP_DRIFT_MAX = 1.3   # narrowing or widening
 
 
 @dataclass
@@ -140,12 +172,19 @@ def _slope_class(slope_pct: float) -> str:
 # ----------------------------------------------------------------------
 # 3 + 4. Classification + quality scoring
 # ----------------------------------------------------------------------
-_PATTERN_MAP = {
+_CONVERGING_MAP = {
     ("flat", "up"): "Ascending Triangle",
     ("down", "flat"): "Descending Triangle",
     ("down", "up"): "Symmetrical Triangle",
     ("up", "up"): "Rising Wedge",
     ("down", "down"): "Falling Wedge",
+}
+
+# New in this revision. Right-angled broadening variants (flat/down,
+# up/flat) aren't mapped yet — only the classic symmetric megaphone
+# (rising highs, falling lows) is currently supported.
+_DIVERGING_MAP = {
+    ("up", "down"): "Broadening Wedge",
 }
 
 
@@ -183,23 +222,42 @@ def classify(high: np.ndarray, low: np.ndarray, close: np.ndarray,
                               reason=(f"poor line fit (upper R2={upper.r2:.2f}/resid={upper.resid_std_pct:.2f}%, "
                                       f"lower R2={lower.r2:.2f}/resid={lower.resid_std_pct:.2f}%)"))
 
-    # Convergence: gap must be shrinking (upper slope < lower slope) and
-    # must start out meaningfully open (not already-touching noise).
     x0 = min(upper.x.min(), lower.x.min())
     gap0 = (upper.value_at(x0) - lower.value_at(x0))
     gap0_pct = (gap0 / mean_price) * 100.0
+    x1 = max(upper.x.max(), lower.x.max())
+    gap1 = upper.value_at(x1) - lower.value_at(x1)
+    gap1_pct = (gap1 / mean_price) * 100.0
+    x_full = np.arange(len(close), dtype=float)
+    upper_containment = _containment_pct(upper, x_full, high, mean_price, "upper")
+    lower_containment = _containment_pct(lower, x_full, low, mean_price, "lower")
 
-    if upper.slope >= lower.slope:
-        return PatternResult(None, upper, lower, 0.0, None,
-                              reason="lines are not converging (upper slope >= lower slope)")
+    if upper.slope < lower.slope:
+        # Exactly Phase 1's original converging pipeline — unchanged.
+        return _classify_converging(upper, lower, gap0_pct, gap1_pct,
+                                     upper_containment, lower_containment, close)
 
+    # New in this revision: previously this was a blanket rejection
+    # ("lines are not converging"). Now split into diverging (Broadening
+    # Wedge candidate) vs. roughly parallel (Rectangle candidate).
+    slope_diff_pct = lower.slope_pct - upper.slope_pct  # <= 0 here, by construction
+    if abs(slope_diff_pct) <= MIN_SLOPE_DIFF_PCT:
+        return _classify_parallel(upper, lower, gap0_pct, gap1_pct,
+                                   upper_containment, lower_containment, close)
+    return _classify_diverging(upper, lower, gap0_pct, gap1_pct,
+                                upper_containment, lower_containment, close)
+
+
+def _classify_converging(upper: TrendLine, lower: TrendLine, gap0_pct: float, gap1_pct: float,
+                          upper_containment: float, lower_containment: float,
+                          close: np.ndarray) -> PatternResult:
+    """Triangles + wedges. Identical logic/thresholds to Phase 1 — only
+    reorganized into its own function so the new branches could be added
+    alongside it without touching this validated path."""
     if gap0_pct < MIN_CONVERGENCE_GAP_PCT:
         return PatternResult(None, upper, lower, 0.0, None,
                               reason=f"lines already too close at start ({gap0_pct:.2f}% of price)")
 
-    x1 = max(upper.x.max(), lower.x.max())
-    gap1 = upper.value_at(x1) - lower.value_at(x1)
-    gap1_pct = (gap1 / mean_price) * 100.0
     if gap1_pct > gap0_pct * MAX_END_GAP_RATIO:
         return PatternResult(None, upper, lower, 0.0, None,
                               reason=(f"insufficient narrowing by window end (gap went from "
@@ -207,9 +265,6 @@ def classify(high: np.ndarray, low: np.ndarray, close: np.ndarray,
                                       f"ratio={gap1_pct/gap0_pct:.2f} > {MAX_END_GAP_RATIO}) "
                                       f"— looks like a parallel trend channel, not a converging pattern"))
 
-    x_full = np.arange(len(close), dtype=float)
-    upper_containment = _containment_pct(upper, x_full, high, mean_price, "upper")
-    lower_containment = _containment_pct(lower, x_full, low, mean_price, "lower")
     if upper_containment < MIN_CONTAINMENT_PCT or lower_containment < MIN_CONTAINMENT_PCT:
         return PatternResult(None, upper, lower, 0.0, None,
                               reason=(f"price wasn't actually contained inside the channel "
@@ -218,35 +273,118 @@ def classify(high: np.ndarray, low: np.ndarray, close: np.ndarray,
                                       f"only coincidentally fits narrowing swing extremes, not a real pattern"))
 
     key = (_slope_class(upper.slope_pct), _slope_class(lower.slope_pct))
-    pattern = _PATTERN_MAP.get(key)
+    pattern = _CONVERGING_MAP.get(key)
     if pattern is None:
         return PatternResult(None, upper, lower, 0.0, None,
-                              reason=f"slope combination ({key[0]}/{key[1]}) doesn't match a known pattern")
+                              reason=f"slope combination ({key[0]}/{key[1]}) doesn't match a known converging pattern")
 
-    quality = _quality_score(upper, lower, gap0_pct, gap1_pct, upper_containment, lower_containment)
+    quality = _quality_score("converging", upper, lower, gap0_pct, gap1_pct, upper_containment, lower_containment)
     breakout = _check_breakout(upper, lower, close)
-
     return PatternResult(pattern, upper, lower, quality, breakout)
 
 
-def _quality_score(upper: TrendLine, lower: TrendLine, gap0_pct: float, gap1_pct: float,
+def _classify_diverging(upper: TrendLine, lower: TrendLine, gap0_pct: float, gap1_pct: float,
+                         upper_containment: float, lower_containment: float,
+                         close: np.ndarray) -> PatternResult:
+    """New in this revision. Broadening Wedge (megaphone) — the mirror
+    image of the converging branch: gap must start meaningfully open and
+    then genuinely widen, with price still contained inside the
+    (now-widening) channel throughout."""
+    if gap0_pct < MIN_DIVERGENCE_GAP_PCT:
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=f"lines already too close at start for a broadening pattern ({gap0_pct:.2f}% of price)")
+
+    widening_ratio = gap1_pct / gap0_pct if gap0_pct > 0 else 1.0
+    if gap1_pct < gap0_pct * MIN_WIDENING_RATIO:
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=(f"insufficient widening by window end (gap went from "
+                                      f"{gap0_pct:.2f}% to {gap1_pct:.2f}% of price, "
+                                      f"ratio={widening_ratio:.2f} < {MIN_WIDENING_RATIO}) "
+                                      f"— looks like noise around a parallel channel, not genuine broadening"))
+
+    if upper_containment < MIN_CONTAINMENT_PCT or lower_containment < MIN_CONTAINMENT_PCT:
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=(f"price wasn't actually contained inside the widening channel "
+                                      f"(upper={upper_containment:.0%}, lower={lower_containment:.0%}, "
+                                      f"need >={MIN_CONTAINMENT_PCT:.0%})"))
+
+    key = (_slope_class(upper.slope_pct), _slope_class(lower.slope_pct))
+    pattern = _DIVERGING_MAP.get(key)
+    if pattern is None:
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=(f"slope combination ({key[0]}/{key[1]}) doesn't match a known broadening "
+                                      f"pattern (only up/down — rising highs + falling lows — is supported)"))
+
+    quality = _quality_score("diverging", upper, lower, gap0_pct, gap1_pct, upper_containment, lower_containment)
+    breakout = _check_breakout(upper, lower, close)
+    return PatternResult(pattern, upper, lower, quality, breakout)
+
+
+def _classify_parallel(upper: TrendLine, lower: TrendLine, gap0_pct: float, gap1_pct: float,
+                        upper_containment: float, lower_containment: float,
+                        close: np.ndarray) -> PatternResult:
+    """New in this revision. Rectangle — both lines must individually be
+    flat (not just close to each other in slope), the channel must have
+    real width (not near-zero noise), and that width must stay roughly
+    constant throughout, with price genuinely contained inside it."""
+    if _slope_class(upper.slope_pct) != "flat" or _slope_class(lower.slope_pct) != "flat":
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=(f"lines are roughly parallel but not flat "
+                                      f"(upper={upper.slope_pct:+.3f}%/bar, lower={lower.slope_pct:+.3f}%/bar) "
+                                      f"— a parallel trend channel, not a Rectangle"))
+
+    if gap0_pct < MIN_RECTANGLE_GAP_PCT:
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=f"channel too narrow to be a real Rectangle ({gap0_pct:.2f}% of price, need >={MIN_RECTANGLE_GAP_PCT}%)")
+
+    drift_ratio = gap1_pct / gap0_pct if gap0_pct > 0 else 1.0
+    if not (RECTANGLE_GAP_DRIFT_MIN <= drift_ratio <= RECTANGLE_GAP_DRIFT_MAX):
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=(f"channel width drifted too much to be a clean Rectangle "
+                                      f"(ratio={drift_ratio:.2f}, need {RECTANGLE_GAP_DRIFT_MIN}-{RECTANGLE_GAP_DRIFT_MAX})"))
+
+    if upper_containment < MIN_CONTAINMENT_PCT or lower_containment < MIN_CONTAINMENT_PCT:
+        return PatternResult(None, upper, lower, 0.0, None,
+                              reason=(f"price wasn't actually contained inside the range "
+                                      f"(upper={upper_containment:.0%}, lower={lower_containment:.0%}, "
+                                      f"need >={MIN_CONTAINMENT_PCT:.0%})"))
+
+    quality = _quality_score("parallel", upper, lower, gap0_pct, gap1_pct, upper_containment, lower_containment)
+    breakout = _check_breakout(upper, lower, close)
+    return PatternResult("Rectangle", upper, lower, quality, breakout)
+
+
+def _quality_score(shape: str, upper: TrendLine, lower: TrendLine, gap0_pct: float, gap1_pct: float,
                     upper_containment: float, lower_containment: float) -> float:
     """0-100 composite: fit quality (40%), touch count (15%), openness of
-    the initial gap as a proxy for a 'real' pattern vs noise (10%), how
-    tightly the lines converged by the end (15%), and how well price
-    actually stayed contained inside the channel throughout (20%) —
-    this last term is what separates a genuine oscillating pattern from
-    a trend+reversal that only coincidentally fits narrowing extremes."""
+    the initial gap as a proxy for a 'real' pattern vs noise (10%), a
+    shape-specific term (15%) — how tightly the lines converged / widened
+    / stayed flat, depending on `shape` — and how well price actually
+    stayed contained inside the channel throughout (20%): this last term
+    is what separates a genuine oscillating pattern from a trend+reversal
+    that only coincidentally fits the swing extremes.
+
+    `shape` is one of "converging" (original Phase-1 scoring, unchanged),
+    "diverging", or "parallel" (both new in this revision)."""
     upper_fit = upper.r2 if upper.r2 >= MIN_R2 else max(0.0, 1 - upper.resid_std_pct / MAX_RESID_STD_PCT)
     lower_fit = lower.r2 if lower.r2 >= MIN_R2 else max(0.0, 1 - lower.resid_std_pct / MAX_RESID_STD_PCT)
     fit_score = ((upper_fit + lower_fit) / 2.0) * 100.0
     touch_score = min((upper.touches + lower.touches) / 8.0, 1.0) * 100.0
     gap_score = min(gap0_pct / 3.0, 1.0) * 100.0
-    narrowing_ratio = gap1_pct / gap0_pct if gap0_pct > 0 else 1.0
-    narrowing_score = max(0.0, 1 - narrowing_ratio / MAX_END_GAP_RATIO) * 100.0
+
+    if shape == "converging":
+        narrowing_ratio = gap1_pct / gap0_pct if gap0_pct > 0 else 1.0
+        shape_score = max(0.0, 1 - narrowing_ratio / MAX_END_GAP_RATIO) * 100.0
+    elif shape == "diverging":
+        widening_ratio = gap1_pct / gap0_pct if gap0_pct > 0 else 1.0
+        shape_score = min(max(0.0, (widening_ratio - 1.0) / (WIDENING_SCORE_REF - 1.0)), 1.0) * 100.0
+    else:  # "parallel"
+        drift_ratio = gap1_pct / gap0_pct if gap0_pct > 0 else 1.0
+        shape_score = max(0.0, 1 - abs(drift_ratio - 1.0) / (RECTANGLE_GAP_DRIFT_MAX - 1.0)) * 100.0
+
     containment_score = ((upper_containment + lower_containment) / 2.0) * 100.0
     return round(0.40 * fit_score + 0.15 * touch_score + 0.10 * gap_score
-                 + 0.15 * narrowing_score + 0.20 * containment_score, 1)
+                 + 0.15 * shape_score + 0.20 * containment_score, 1)
 
 
 def _check_breakout(upper: TrendLine, lower: TrendLine, close: np.ndarray) -> Optional[str]:
@@ -317,6 +455,12 @@ def _synthetic_cases():
         "Falling Wedge": _build_series(upper_start=118, upper_end=100,  # both fall
                                         lower_start=112, lower_end=98,  # upper falls faster -> converge
                                         seed=5),
+        "Rectangle": _build_series(upper_start=110, upper_end=110,     # flat resistance
+                                    lower_start=95, lower_end=95,       # flat support, stays parallel
+                                    seed=6),
+        "Broadening Wedge": _build_series(upper_start=100, upper_end=118,  # rising highs
+                                           lower_start=97, lower_end=80,   # falling lows -> diverge
+                                           seed=7),
     }
 
 
